@@ -10,6 +10,10 @@ pub const MEM_AVAILABLE_WARN_PCT: f64 = 15.0;
 pub const MEM_AVAILABLE_CRIT_PCT: f64 = 5.0;
 pub const SWAP_WARN_PCT: f64 = 50.0;
 pub const SWAP_CRIT_PCT: f64 = 80.0;
+pub const DISK_WARN_PCT: f64 = 80.0;
+pub const DISK_CRIT_PCT: f64 = 90.0;
+pub const INODE_WARN_PCT: f64 = 80.0;
+pub const INODE_CRIT_PCT: f64 = 90.0;
 
 fn high(value: f64, warn: f64, crit: f64) -> Option<Severity> {
     if value >= crit {
@@ -19,6 +23,11 @@ fn high(value: f64, warn: f64, crit: f64) -> Option<Severity> {
     } else {
         None
     }
+}
+
+fn level(value: Option<f64>, warn: f64, crit: f64) -> Option<(f64, Severity)> {
+    let v = value?;
+    high(v, warn, crit).map(|sev| (v, sev))
 }
 
 fn finding(
@@ -84,22 +93,59 @@ pub fn evaluate(snap: &Snapshot) -> Vec<Finding> {
             ));
         }
 
-        if let Some(swap) = mem.swap_used_pct()
-            && let Some(sev) = high(swap, SWAP_WARN_PCT, SWAP_CRIT_PCT)
-        {
+        if let Some((swap, sev)) = level(mem.swap_used_pct(), SWAP_WARN_PCT, SWAP_CRIT_PCT) {
             out.push(finding(
-                    "mem.swap",
-                    sev,
-                    "Swap usage is high",
-                    format!(
-                        "{:.1}% of swap in use ({} of {}).",
-                        swap,
-                        human_bytes(mem.swap_total_kb.saturating_sub(mem.swap_free_kb) * 1024),
-                        human_bytes(mem.swap_total_kb * 1024)
-                    ),
-                    "Heavy swapping slows everything down. Check memory consumers with: ps aux --sort=-%mem | head -n 10",
-                    "/proc/meminfo",
-                ));
+                "mem.swap",
+                sev,
+                "Swap usage is high",
+                format!(
+                    "{:.1}% of swap in use ({} of {}).",
+                    swap,
+                    human_bytes(mem.swap_total_kb.saturating_sub(mem.swap_free_kb) * 1024),
+                    human_bytes(mem.swap_total_kb * 1024)
+                ),
+                "Heavy swapping slows everything down. Check memory consumers with: ps aux --sort=-%mem | head -n 10",
+                "/proc/meminfo",
+            ));
+        }
+    }
+
+    for disk in &snap.disks {
+        if let Some((used, sev)) = level(Some(disk.used_pct()), DISK_WARN_PCT, DISK_CRIT_PCT) {
+            out.push(finding(
+                &format!("disk.usage:{}", disk.mount),
+                sev,
+                &format!("Disk space is running low on {}", disk.mount),
+                format!(
+                    "{:.1}% used; {} free of {} ({}).",
+                    used,
+                    human_bytes(disk.avail_bytes),
+                    human_bytes(disk.total_bytes),
+                    disk.fstype
+                ),
+                &format!(
+                    "See what is taking space with: du -xh {} --max-depth=1 2>/dev/null | sort -h | tail -n 10",
+                    disk.mount
+                ),
+                "statvfs",
+            ));
+        }
+
+        if let Some((inodes, sev)) = level(disk.inode_used_pct(), INODE_WARN_PCT, INODE_CRIT_PCT) {
+            out.push(finding(
+                &format!("disk.inodes:{}", disk.mount),
+                sev,
+                &format!("Inodes are running low on {}", disk.mount),
+                format!(
+                    "{:.1}% of inodes used ({} of {}).",
+                    inodes, disk.inodes_used, disk.inodes_total
+                ),
+                &format!(
+                    "Many tiny files are the usual cause. Find the heavy directories with: find {} -xdev -type f | cut -d/ -f1-4 | sort | uniq -c | sort -n | tail -n 10",
+                    disk.mount
+                ),
+                "statvfs",
+            ));
         }
     }
 
@@ -110,7 +156,7 @@ pub fn evaluate(snap: &Snapshot) -> Vec<Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collectors::{cpu::LoadInfo, memory::MemInfo};
+    use crate::collectors::{cpu::LoadInfo, disk::DiskInfo, memory::MemInfo};
 
     fn healthy() -> Snapshot {
         Snapshot {
@@ -127,6 +173,15 @@ mod tests {
                 swap_total_kb: 1_000_000,
                 swap_free_kb: 1_000_000,
             }),
+            disks: vec![DiskInfo {
+                mount: "/".into(),
+                fstype: "ext4".into(),
+                total_bytes: 100_000,
+                used_bytes: 20_000,
+                avail_bytes: 80_000,
+                inodes_total: 1000,
+                inodes_used: 100,
+            }],
             skipped: vec![],
         }
     }
@@ -167,5 +222,57 @@ mod tests {
         let f = evaluate(&s);
         assert_eq!(f[0].id, "mem.swap");
         assert_eq!(f[0].severity, Severity::Critical);
+    }
+
+    #[test]
+    fn full_disk_is_critical_and_names_the_mount() {
+        let mut s = healthy();
+        s.disks[0].used_bytes = 95_000;
+        s.disks[0].avail_bytes = 5_000;
+        let f = evaluate(&s);
+        assert_eq!(f[0].id, "disk.usage:/");
+        assert_eq!(f[0].severity, Severity::Critical);
+        assert!(f[0].next_step.contains("du -xh /"));
+    }
+
+    #[test]
+    fn disk_warns_between_80_and_90_percent() {
+        let mut s = healthy();
+        s.disks[0].used_bytes = 85_000;
+        s.disks[0].avail_bytes = 15_000;
+        assert_eq!(evaluate(&s)[0].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn inode_exhaustion_is_detected() {
+        let mut s = healthy();
+        s.disks[0].inodes_used = 950;
+        let f = evaluate(&s);
+        assert_eq!(f[0].id, "disk.inodes:/");
+        assert_eq!(f[0].severity, Severity::Critical);
+    }
+
+    #[test]
+    fn filesystems_without_inode_counts_are_not_flagged() {
+        let mut s = healthy();
+        s.disks[0].inodes_total = 0;
+        s.disks[0].inodes_used = 0;
+        assert!(evaluate(&s).is_empty());
+    }
+
+    #[test]
+    fn findings_are_sorted_worst_first() {
+        let mut s = healthy();
+        s.disks[0].used_bytes = 85_000;
+        s.disks[0].avail_bytes = 15_000;
+        s.load = Some(LoadInfo {
+            load1: 9.0,
+            load5: 8.0,
+            load15: 7.0,
+            cores: 4,
+        });
+        let f = evaluate(&s);
+        assert_eq!(f[0].severity, Severity::Critical);
+        assert_eq!(f.last().unwrap().severity, Severity::Warning);
     }
 }

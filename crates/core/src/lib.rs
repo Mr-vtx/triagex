@@ -6,7 +6,7 @@ pub mod finding;
 pub mod rules;
 pub mod util;
 
-use collectors::{cpu::LoadInfo, memory::MemInfo};
+use collectors::{cpu::LoadInfo, disk::DiskInfo, memory::MemInfo};
 use finding::Report;
 use util::human_bytes;
 
@@ -15,6 +15,7 @@ pub struct Snapshot {
     pub hostname: String,
     pub load: Option<LoadInfo>,
     pub memory: Option<MemInfo>,
+    pub disks: Vec<DiskInfo>,
     pub skipped: Vec<String>,
 }
 
@@ -36,13 +37,24 @@ impl Snapshot {
                 None
             }
         };
+        let disks = match collectors::disk::collect() {
+            Ok(v) => v,
+            Err(e) => {
+                skipped.push(format!("disk: {e}"));
+                Vec::new()
+            }
+        };
+
         Snapshot {
             hostname: hostname(),
             load,
             memory,
+            disks,
             skipped,
         }
     }
+
+    /// Plain-language readings, so "no issues" still shows what was checked.
     pub fn readings(&self) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(l) = &self.load {
@@ -62,6 +74,20 @@ impl Snapshot {
                 Some(p) => out.push(format!("swap: {p:.1}% used")),
                 None => out.push("swap: none".to_string()),
             }
+        }
+        for d in &self.disks {
+            let inodes = d
+                .inode_used_pct()
+                .map(|p| format!(", inodes {p:.1}% used"))
+                .unwrap_or_default();
+            out.push(format!(
+                "disk {}: {:.1}% used ({} free of {}){}",
+                d.mount,
+                d.used_pct(),
+                human_bytes(d.avail_bytes),
+                human_bytes(d.total_bytes),
+                inodes
+            ));
         }
         out
     }
