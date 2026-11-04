@@ -1,7 +1,7 @@
 use crate::{
-    Snapshot,
     finding::{Finding, Severity},
     util::human_bytes,
+    Snapshot,
 };
 
 pub const LOAD_WARN: f64 = 1.0;
@@ -15,6 +15,7 @@ pub const DISK_CRIT_PCT: f64 = 90.0;
 pub const INODE_WARN_PCT: f64 = 80.0;
 pub const INODE_CRIT_PCT: f64 = 90.0;
 
+/// Severity for "higher is worse" readings.
 fn high(value: f64, warn: f64, crit: f64) -> Option<Severity> {
     if value >= crit {
         Some(Severity::Critical)
@@ -25,6 +26,7 @@ fn high(value: f64, warn: f64, crit: f64) -> Option<Severity> {
     }
 }
 
+/// Like `high`, but for an optional reading; returns the value alongside the severity.
 fn level(value: Option<f64>, warn: f64, crit: f64) -> Option<(f64, Severity)> {
     let v = value?;
     high(v, warn, crit).map(|sev| (v, sev))
@@ -149,6 +151,21 @@ pub fn evaluate(snap: &Snapshot) -> Vec<Finding> {
         }
     }
 
+    if let Some(units) = &snap.failed_units {
+        for unit in units {
+            out.push(finding(
+                &format!("systemd.failed:{unit}"),
+                Severity::Warning,
+                &format!("systemd unit failed: {unit}"),
+                format!("`systemctl --failed` lists {unit} in a failed state."),
+                &format!(
+                    "Inspect it with: systemctl status {unit} && journalctl -u {unit} -n 50 --no-pager"
+                ),
+                "systemctl",
+            ));
+        }
+    }
+
     out.sort_by(|a, b| b.severity.cmp(&a.severity).then_with(|| a.id.cmp(&b.id)));
     out
 }
@@ -182,6 +199,7 @@ mod tests {
                 inodes_total: 1000,
                 inodes_used: 100,
             }],
+            failed_units: Some(vec![]),
             skipped: vec![],
         }
     }
@@ -257,6 +275,24 @@ mod tests {
         let mut s = healthy();
         s.disks[0].inodes_total = 0;
         s.disks[0].inodes_used = 0;
+        assert!(evaluate(&s).is_empty());
+    }
+
+    #[test]
+    fn failed_unit_becomes_a_warning_with_a_next_step() {
+        let mut s = healthy();
+        s.failed_units = Some(vec!["nginx.service".into()]);
+        let f = evaluate(&s);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].id, "systemd.failed:nginx.service");
+        assert_eq!(f[0].severity, Severity::Warning);
+        assert!(f[0].next_step.contains("journalctl -u nginx.service"));
+    }
+
+    #[test]
+    fn unavailable_systemd_is_not_a_finding() {
+        let mut s = healthy();
+        s.failed_units = None;
         assert!(evaluate(&s).is_empty());
     }
 

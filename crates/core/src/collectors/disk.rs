@@ -24,6 +24,7 @@ pub struct DiskInfo {
 }
 
 impl DiskInfo {
+    /// Same math as `df`: used / (used + available to unprivileged users).
     pub fn used_pct(&self) -> f64 {
         let denom = self.used_bytes + self.avail_bytes;
         if denom == 0 {

@@ -16,6 +16,7 @@ pub struct Snapshot {
     pub load: Option<LoadInfo>,
     pub memory: Option<MemInfo>,
     pub disks: Vec<DiskInfo>,
+    pub failed_units: Option<Vec<String>>,
     pub skipped: Vec<String>,
 }
 
@@ -45,16 +46,24 @@ impl Snapshot {
             }
         };
 
+        let failed_units = match collectors::systemd::collect() {
+            Ok(v) => Some(v),
+            Err(e) => {
+                skipped.push(format!("systemd: {e}"));
+                None
+            }
+        };
+
         Snapshot {
             hostname: hostname(),
             load,
             memory,
             disks,
+            failed_units,
             skipped,
         }
     }
 
-    /// Plain-language readings, so "no issues" still shows what was checked.
     pub fn readings(&self) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(l) = &self.load {
@@ -88,6 +97,11 @@ impl Snapshot {
                 human_bytes(d.total_bytes),
                 inodes
             ));
+        }
+        match &self.failed_units {
+            Some(units) if units.is_empty() => out.push("systemd: no failed units".to_string()),
+            Some(units) => out.push(format!("systemd: {} failed unit(s)", units.len())),
+            None => {}
         }
         out
     }
