@@ -1,7 +1,7 @@
 use crate::{
+    Snapshot,
     finding::{Finding, Severity},
     util::human_bytes,
-    Snapshot,
 };
 
 pub const LOAD_WARN: f64 = 1.0;
@@ -126,7 +126,7 @@ pub fn evaluate(snap: &Snapshot) -> Vec<Finding> {
                     disk.fstype
                 ),
                 &format!(
-                    "See what is taking space with: du -xh {} --max-depth=1 2>/dev/null | sort -h | tail -n 10",
+                    "See what is taking space with: du -xh {} --max-depth=1 2>/dev/null | sort -h | tail -n 10. If df reports much more used than du explains, a deleted file may still be held open by a process: check with `sudo lsof +L1`.",
                     disk.mount
                 ),
                 "statvfs",
@@ -250,6 +250,16 @@ mod tests {
         let f = evaluate(&s);
         assert_eq!(f[0].id, "disk.usage:/");
         assert_eq!(f[0].severity, Severity::Critical);
+        assert!(f[0].next_step.contains("du -xh /"));
+    }
+
+    #[test]
+    fn disk_next_step_mentions_deleted_files_held_open() {
+        let mut s = healthy();
+        s.disks[0].used_bytes = 95_000;
+        s.disks[0].avail_bytes = 5_000;
+        let f = evaluate(&s);
+        assert!(f[0].next_step.contains("lsof +L1"));
         assert!(f[0].next_step.contains("du -xh /"));
     }
 
