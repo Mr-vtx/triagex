@@ -3,7 +3,9 @@
 
 pub mod collectors;
 pub mod finding;
+pub mod logs;
 pub mod rules;
+pub mod time;
 pub mod util;
 
 use collectors::{cpu::LoadInfo, disk::DiskInfo, memory::MemInfo};
@@ -16,7 +18,9 @@ pub struct Snapshot {
     pub load: Option<LoadInfo>,
     pub memory: Option<MemInfo>,
     pub disks: Vec<DiskInfo>,
+    /// None means the check could not run (see `skipped`).
     pub failed_units: Option<Vec<String>>,
+    /// Checks that could not run, with the reason. Never silently dropped.
     pub skipped: Vec<String>,
 }
 
@@ -64,6 +68,7 @@ impl Snapshot {
         }
     }
 
+    /// Plain-language readings, so "no issues" still shows what was checked.
     pub fn readings(&self) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(l) = &self.load {
