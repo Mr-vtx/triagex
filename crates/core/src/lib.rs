@@ -3,7 +3,10 @@
 
 pub mod collectors;
 pub mod finding;
+pub mod host;
+pub mod investigation;
 pub mod logs;
+pub mod markdown;
 pub mod rules;
 pub mod time;
 pub mod util;

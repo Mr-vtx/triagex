@@ -2,12 +2,14 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use triagex_core::{
     Snapshot,
     finding::{Finding, Severity},
+    host::format_uptime,
+    investigation::{Investigation, investigate},
     logs::{GroupView, LogOptions, LogReport, analyze},
-    rules,
+    markdown, rules,
     time::parse_duration,
 };
 
@@ -16,44 +18,97 @@ use triagex_core::{
     name = "triagex",
     version,
     about = "Linux server diagnostics. Read-only, single binary, no outbound network.",
-    after_help = "Run with no command to check this machine's health."
+    after_help = "Run with no command for a quick overview of this server."
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
+    /// Overview only: look at logs from the last N (30m, 2h, 1d, 1w, or "all")
+    #[arg(long, default_value = "24h")]
+    since: String,
+
+    /// print JSON instead of text
     #[arg(long)]
     json: bool,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum Format {
+    Text,
+    Json,
+    #[value(alias = "md")]
+    Markdown,
+}
+
 #[derive(Subcommand)]
 enum Commands {
-    /// Group repeated log errors and show when they happened
-    Logs {
+    /// Detailed investigation: system findings, log groups and evidence
+    Report {
+        /// Output format
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
+        /// Write the report to this file instead of printing it (json or markdown)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Log file to include (repeatable). Default: the journal plus /var/log/auth.log
         #[arg(short, long = "file")]
         files: Vec<PathBuf>,
+        /// Only look at logs from the last N: 30m, 2h, 1d, 1w, or "all"
+        #[arg(long, default_value = "24h")]
+        since: String,
+        /// How many log groups to include
+        #[arg(long, default_value_t = 15)]
+        top: usize,
+    },
+    /// Run only the system checks (exit code: 0 ok, 1 warnings, 2 critical)
+    Check {
+        /// Print the findings as JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Group repeated log errors and show when they happened
+    Logs {
+        /// Log file to read (repeatable). Default: the journal plus /var/log/auth.log
+        #[arg(short, long = "file")]
+        files: Vec<PathBuf>,
+        /// Read warnings and worse from the systemd journal
         #[arg(long)]
         journal: bool,
         /// Only look at the last N: 30m, 2h, 1d, 1w, or "all"
         #[arg(long, default_value = "24h")]
         since: String,
+        /// How many groups to show
         #[arg(long, default_value_t = 10)]
         top: usize,
+        /// Include every line from files, not just lines that look like problems
         #[arg(long)]
         all: bool,
+        /// Print the report as JSON instead of text
         #[arg(long)]
         json: bool,
     },
 }
 
 fn main() -> ExitCode {
+    // Behave like a normal Unix tool when piped (`triagex logs | head`): exit quietly on a
+    // closed pipe instead of panicking. Rust ignores SIGPIPE by default.
+    // SAFETY: restoring the default disposition of SIGPIPE is sound and happens before any threads start.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 
     let cli = Cli::parse();
     match cli.command {
-        None => system_check(cli.json),
+        None => overview(&cli.since, cli.json),
+        Some(Commands::Report {
+            format,
+            output,
+            files,
+            since,
+            top,
+        }) => report(format, output, files, &since, top),
+        Some(Commands::Check { json }) => system_check(json),
         Some(Commands::Logs {
             files,
             journal,
@@ -107,6 +162,83 @@ fn parse_since(since: &str) -> Result<Option<i64>, ExitCode> {
 
 fn worst(findings: &[Finding]) -> Option<Severity> {
     findings.iter().map(|f| f.severity).max()
+}
+
+fn overview(since: &str, json: bool) -> ExitCode {
+    let since_secs = match parse_since(since) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let inv = investigate(&LogOptions {
+        since_secs,
+        top: 3,
+        ..LogOptions::default()
+    });
+
+    if json {
+        if let Err(code) = print_json(&inv) {
+            return code;
+        }
+    } else {
+        print_investigation(&inv, Some(5));
+        println!(
+            "Run `triagex report` for the full investigation, or `triagex logs` for log triage."
+        );
+    }
+    exit_for(inv.worst())
+}
+
+fn report(
+    format: Format,
+    output: Option<PathBuf>,
+    files: Vec<PathBuf>,
+    since: &str,
+    top: usize,
+) -> ExitCode {
+    let since_secs = match parse_since(since) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    if output.is_some() && matches!(format, Format::Text) {
+        eprintln!("triagex: --output needs --format json or --format markdown");
+        return ExitCode::from(3);
+    }
+
+    let inv = investigate(&LogOptions {
+        use_defaults: files.is_empty(),
+        files,
+        journal: false,
+        since_secs,
+        all_lines: false,
+        top,
+    });
+
+    let rendered = match format {
+        Format::Text => {
+            print_investigation(&inv, None);
+            return exit_for(inv.worst());
+        }
+        Format::Json => match serde_json::to_string_pretty(&inv) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("triagex: failed to serialize report: {e}");
+                return ExitCode::from(3);
+            }
+        },
+        Format::Markdown => markdown::render(&inv),
+    };
+
+    match output {
+        Some(path) => {
+            if let Err(e) = std::fs::write(&path, rendered) {
+                eprintln!("triagex: could not write {}: {e}", path.display());
+                return ExitCode::from(3);
+            }
+            println!("Wrote report to {}", path.display());
+        }
+        None => println!("{rendered}"),
+    }
+    exit_for(inv.worst())
 }
 
 fn system_check(json: bool) -> ExitCode {
@@ -206,6 +338,7 @@ fn print_skipped(skipped: &[String]) {
     }
 }
 
+/// Draws a group's timeline: scaled to that group's busiest bucket, "·" for no activity.
 fn sparkline(values: &[u32]) -> String {
     const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     let max = values.iter().copied().max().unwrap_or(0);
@@ -296,6 +429,84 @@ fn print_logs(report: &LogReport) {
         print_findings(&report.findings, color);
     }
     print_skipped(&report.skipped);
+}
+
+fn host_line(inv: &Investigation) -> String {
+    let h = &inv.host;
+    let mut parts = vec![format!("triagex {}", inv.version), h.hostname.clone()];
+    if let Some(os) = &h.os {
+        parts.push(os.clone());
+    }
+    if let Some(k) = &h.kernel {
+        parts.push(format!("kernel {k}"));
+    }
+    if let Some(u) = h.uptime_secs {
+        parts.push(format!("up {}", format_uptime(u)));
+    }
+    parts.push(format!("{} cores", h.cpu_cores));
+    parts.join(" | ")
+}
+
+/// Shared by the overview (limited findings) and the report (everything).
+fn print_investigation(inv: &Investigation, max_findings: Option<usize>) {
+    let color = use_color();
+    println!("{}", paint(&host_line(inv), "1", color));
+    println!();
+
+    if !inv.readings.is_empty() {
+        println!("Checked:");
+        for r in &inv.readings {
+            println!("  {r}");
+        }
+        println!();
+    }
+
+    if inv.findings.is_empty() {
+        println!("{}", paint("No issues found.", "32", color));
+        println!();
+    } else {
+        let shown = max_findings.unwrap_or(inv.findings.len());
+        print_findings(&inv.findings[..shown.min(inv.findings.len())], color);
+        if inv.findings.len() > shown {
+            println!(
+                "... and {} more findings (see `triagex report`)",
+                inv.findings.len() - shown
+            );
+            println!();
+        }
+    }
+
+    if !inv.log_groups.is_empty() {
+        let window = inv
+            .since
+            .as_deref()
+            .map(|s| format!("last {s}"))
+            .unwrap_or_else(|| "all time".to_string());
+        println!(
+            "{}",
+            paint(
+                &format!(
+                    "Log highlights ({window}, {} lines scanned, {} groups)",
+                    inv.log_lines_scanned, inv.log_groups_total
+                ),
+                "1",
+                color
+            )
+        );
+        println!();
+        for (i, g) in inv.log_groups.iter().enumerate() {
+            print_group(i + 1, g, color);
+        }
+    }
+
+    print_skipped(&inv.skipped);
+
+    println!(
+        "{} critical, {} warning, {} info",
+        inv.count(Severity::Critical),
+        inv.count(Severity::Warning),
+        inv.count(Severity::Info)
+    );
 }
 
 #[cfg(test)]
