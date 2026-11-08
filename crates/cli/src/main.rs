@@ -1,4 +1,7 @@
-use std::io::IsTerminal;
+mod about;
+mod render;
+mod ui;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -6,12 +9,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 use triagex_core::{
     Snapshot,
     finding::{Finding, Severity},
-    host::format_uptime,
-    investigation::{Investigation, investigate},
-    logs::{GroupView, LogOptions, LogReport, analyze},
+    investigation::investigate,
+    logs::{LogOptions, analyze},
     markdown, rules,
     time::parse_duration,
 };
+use ui::{ColorMode, Theme, Ui};
 
 #[derive(Parser)]
 #[command(
@@ -28,9 +31,25 @@ struct Cli {
     #[arg(long, default_value = "24h")]
     since: String,
 
-    /// print JSON instead of text
+    /// Overview only: print JSON instead of text
     #[arg(long)]
     json: bool,
+
+    /// When to use colors
+    #[arg(long, value_enum, global = true, default_value_t = ColorMode::Auto)]
+    color: ColorMode,
+
+    /// Color theme (or set TRIAGEX_THEME)
+    #[arg(long, value_enum, global = true)]
+    theme: Option<Theme>,
+
+    /// Hide the logo banner
+    #[arg(long, global = true)]
+    no_banner: bool,
+
+    /// Tighter layout: no padding inside panels, no gaps between them
+    #[arg(long, global = true)]
+    compact: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -88,6 +107,8 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Show version, codename, author and source
+    About,
 }
 
 fn main() -> ExitCode {
@@ -99,16 +120,20 @@ fn main() -> ExitCode {
     }
 
     let cli = Cli::parse();
+    let ui = Ui::detect(cli.color, ui::resolve_theme(cli.theme), cli.compact);
+    // The big logo only appears when colors are on (a real terminal), never in pipes or logs.
+    let banner = ui.color && !cli.no_banner;
+
     match cli.command {
-        None => overview(&cli.since, cli.json),
+        None => overview(&ui, &cli.since, cli.json, banner),
         Some(Commands::Report {
             format,
             output,
             files,
             since,
             top,
-        }) => report(format, output, files, &since, top),
-        Some(Commands::Check { json }) => system_check(json),
+        }) => report(&ui, format, output, files, &since, top),
+        Some(Commands::Check { json }) => system_check(&ui, json),
         Some(Commands::Logs {
             files,
             journal,
@@ -116,12 +141,12 @@ fn main() -> ExitCode {
             top,
             all,
             json,
-        }) => logs(files, journal, &since, top, all, json),
+        }) => logs(&ui, files, journal, &since, top, all, json),
+        Some(Commands::About) => {
+            print!("{}", render::about_screen(&ui));
+            ExitCode::SUCCESS
+        }
     }
-}
-
-fn use_color() -> bool {
-    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
 
 fn exit_for(worst: Option<Severity>) -> ExitCode {
@@ -164,7 +189,7 @@ fn worst(findings: &[Finding]) -> Option<Severity> {
     findings.iter().map(|f| f.severity).max()
 }
 
-fn overview(since: &str, json: bool) -> ExitCode {
+fn overview(ui: &Ui, since: &str, json: bool, banner: bool) -> ExitCode {
     let since_secs = match parse_since(since) {
         Ok(s) => s,
         Err(code) => return code,
@@ -180,15 +205,13 @@ fn overview(since: &str, json: bool) -> ExitCode {
             return code;
         }
     } else {
-        print_investigation(&inv, Some(5));
-        println!(
-            "Run `triagex report` for the full investigation, or `triagex logs` for log triage."
-        );
+        print!("{}", render::overview(ui, &inv, Some(5), banner, true));
     }
     exit_for(inv.worst())
 }
 
 fn report(
+    ui: &Ui,
     format: Format,
     output: Option<PathBuf>,
     files: Vec<PathBuf>,
@@ -215,7 +238,7 @@ fn report(
 
     let rendered = match format {
         Format::Text => {
-            print_investigation(&inv, None);
+            print!("{}", render::overview(ui, &inv, None, false, false));
             return exit_for(inv.worst());
         }
         Format::Json => match serde_json::to_string_pretty(&inv) {
@@ -241,7 +264,7 @@ fn report(
     exit_for(inv.worst())
 }
 
-fn system_check(json: bool) -> ExitCode {
+fn system_check(ui: &Ui, json: bool) -> ExitCode {
     let snap = Snapshot::collect();
     let findings = rules::evaluate(&snap);
 
@@ -249,31 +272,25 @@ fn system_check(json: bool) -> ExitCode {
         if let Err(code) = print_json(&findings) {
             return code;
         }
-        return exit_for(worst(&findings));
+    } else {
+        print!(
+            "{}",
+            render::check(
+                ui,
+                &triagex_core::host::collect(),
+                &snap.meters(),
+                &snap.failed_units,
+                &snap.docker,
+                &findings,
+                &snap.skipped
+            )
+        );
     }
-
-    let color = use_color();
-    println!(
-        "{}\n",
-        paint(&format!("triagex | host: {}", snap.hostname), "1", color)
-    );
-
-    println!("Checked:");
-    for reading in snap.readings() {
-        println!("  {reading}");
-    }
-    println!();
-
-    if findings.is_empty() {
-        println!("{}", paint("No issues found.", "32", color));
-        println!();
-    }
-    print_findings(&findings, color);
-    print_skipped(&snap.skipped);
     exit_for(worst(&findings))
 }
 
 fn logs(
+    ui: &Ui,
     files: Vec<PathBuf>,
     journal: bool,
     since: &str,
@@ -301,228 +318,14 @@ fn logs(
             return code;
         }
     } else {
-        print_logs(&report);
+        print!("{}", render::logs(ui, &report));
     }
     exit_for(report.worst())
-}
-
-fn paint(text: &str, code: &str, color: bool) -> String {
-    if color {
-        format!("\x1b[{code}m{text}\x1b[0m")
-    } else {
-        text.to_string()
-    }
-}
-
-fn print_findings(findings: &[Finding], color: bool) {
-    for f in findings {
-        let tag = match f.severity {
-            Severity::Critical => paint("[CRIT]", "1;31", color),
-            Severity::Warning => paint("[WARN]", "1;33", color),
-            Severity::Info => paint("[INFO]", "36", color),
-        };
-        println!("{tag} {}", f.title);
-        println!("       evidence: {}", f.evidence);
-        println!("       next:     {}", f.next_step);
-        println!();
-    }
-}
-
-fn print_skipped(skipped: &[String]) {
-    if !skipped.is_empty() {
-        println!("Skipped:");
-        for s in skipped {
-            println!("  - {s}");
-        }
-        println!();
-    }
-}
-
-/// Draws a group's timeline: scaled to that group's busiest bucket, "·" for no activity.
-fn sparkline(values: &[u32]) -> String {
-    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let max = values.iter().copied().max().unwrap_or(0);
-    values
-        .iter()
-        .map(|&v| {
-            if v == 0 || max == 0 {
-                '·'
-            } else {
-                let idx = ((v as u64 * (BARS.len() as u64 - 1)) / max as u64) as usize;
-                BARS[idx]
-            }
-        })
-        .collect()
-}
-
-fn short_time(rfc3339: &str) -> String {
-    rfc3339.replace('T', " ").trim_end_matches('Z').to_string()
-}
-
-fn print_group(rank: usize, g: &GroupView, color: bool) {
-    println!(
-        "{} {} {}  {}",
-        paint(&format!("#{rank}"), "1", color),
-        paint(&format!("x{}", g.count), "1;33", color),
-        paint(&g.program, "36", color),
-        sparkline(&g.timeline)
-    );
-    println!("    {}", g.pattern);
-    if let (Some(a), Some(b)) = (&g.first_seen, &g.last_seen) {
-        println!(
-            "    first {}   last {}  (UTC)",
-            short_time(a),
-            short_time(b)
-        );
-    }
-    println!("    e.g. {}", g.sample);
-    println!();
-}
-
-fn print_logs(report: &LogReport) {
-    let color = use_color();
-    let window = report
-        .since
-        .as_deref()
-        .map(|s| format!("last {s}"))
-        .unwrap_or_else(|| "all time".to_string());
-    println!(
-        "{}",
-        paint(
-            &format!(
-                "triagex logs {} | host: {} | {}",
-                report.version, report.hostname, window
-            ),
-            "1",
-            color
-        )
-    );
-    if !report.sources.is_empty() {
-        println!("sources: {}", report.sources.join(", "));
-    }
-    println!(
-        "{} lines scanned, {} kept, {} groups",
-        report.lines_scanned, report.lines_matched, report.groups_total
-    );
-    println!();
-
-    if report.groups.is_empty() && report.skipped.is_empty() {
-        println!("{}", paint("No matching log lines.", "32", color));
-        println!();
-    }
-
-    for (i, g) in report.groups.iter().enumerate() {
-        print_group(i + 1, g, color);
-    }
-    if report.groups_total > report.groups.len() {
-        println!(
-            "... and {} more groups (use --top {})",
-            report.groups_total - report.groups.len(),
-            report.groups_total
-        );
-        println!();
-    }
-
-    if !report.findings.is_empty() {
-        println!("{}", paint("Findings", "1", color));
-        println!();
-        print_findings(&report.findings, color);
-    }
-    print_skipped(&report.skipped);
-}
-
-fn host_line(inv: &Investigation) -> String {
-    let h = &inv.host;
-    let mut parts = vec![format!("triagex {}", inv.version), h.hostname.clone()];
-    if let Some(os) = &h.os {
-        parts.push(os.clone());
-    }
-    if let Some(k) = &h.kernel {
-        parts.push(format!("kernel {k}"));
-    }
-    if let Some(u) = h.uptime_secs {
-        parts.push(format!("up {}", format_uptime(u)));
-    }
-    parts.push(format!("{} cores", h.cpu_cores));
-    parts.join(" | ")
-}
-
-/// Shared by the overview (limited findings) and the report (everything).
-fn print_investigation(inv: &Investigation, max_findings: Option<usize>) {
-    let color = use_color();
-    println!("{}", paint(&host_line(inv), "1", color));
-    println!();
-
-    if !inv.readings.is_empty() {
-        println!("Checked:");
-        for r in &inv.readings {
-            println!("  {r}");
-        }
-        println!();
-    }
-
-    if inv.findings.is_empty() {
-        println!("{}", paint("No issues found.", "32", color));
-        println!();
-    } else {
-        let shown = max_findings.unwrap_or(inv.findings.len());
-        print_findings(&inv.findings[..shown.min(inv.findings.len())], color);
-        if inv.findings.len() > shown {
-            println!(
-                "... and {} more findings (see `triagex report`)",
-                inv.findings.len() - shown
-            );
-            println!();
-        }
-    }
-
-    if !inv.log_groups.is_empty() {
-        let window = inv
-            .since
-            .as_deref()
-            .map(|s| format!("last {s}"))
-            .unwrap_or_else(|| "all time".to_string());
-        println!(
-            "{}",
-            paint(
-                &format!(
-                    "Log highlights ({window}, {} lines scanned, {} groups)",
-                    inv.log_lines_scanned, inv.log_groups_total
-                ),
-                "1",
-                color
-            )
-        );
-        println!();
-        for (i, g) in inv.log_groups.iter().enumerate() {
-            print_group(i + 1, g, color);
-        }
-    }
-
-    print_skipped(&inv.skipped);
-
-    println!(
-        "{} critical, {} warning, {} info",
-        inv.count(Severity::Critical),
-        inv.count(Severity::Warning),
-        inv.count(Severity::Info)
-    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sparkline_scales_to_the_busiest_bucket() {
-        assert_eq!(sparkline(&[0, 1, 8]), "·▁█");
-        assert_eq!(sparkline(&[0, 0]), "··");
-    }
-
-    #[test]
-    fn short_time_drops_t_and_z() {
-        assert_eq!(short_time("2026-10-26T09:47:01Z"), "2026-10-26 09:47:01");
-    }
 
     #[test]
     fn since_accepts_durations_and_all() {

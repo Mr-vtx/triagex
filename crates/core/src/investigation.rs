@@ -1,7 +1,11 @@
+//! One investigation = system checks + log triage, merged into a single result.
+//! The overview, the report, and later the watcher and dashboard all consume this.
+
 use serde::Serialize;
 
 use crate::{
-    Snapshot,
+    Meter, Snapshot,
+    collectors::docker::DockerInfo,
     finding::{Finding, Severity},
     host::{self, HostInfo},
     logs::{GroupView, LogOptions, analyze},
@@ -18,6 +22,12 @@ pub struct Investigation {
     pub since: Option<String>,
     /// What was measured, so "no issues" still shows what was checked.
     pub readings: Vec<String>,
+    /// The same measurements as gauges, for the terminal UI.
+    pub meters: Vec<Meter>,
+    /// None means systemd could not be queried (see `skipped`).
+    pub failed_units: Option<Vec<String>>,
+    /// None means Docker is not installed here (or could not be queried).
+    pub docker: Option<DockerInfo>,
     pub findings: Vec<Finding>,
     pub log_sources: Vec<String>,
     pub log_lines_scanned: u64,
@@ -42,6 +52,9 @@ impl Investigation {
 pub fn investigate(opts: &LogOptions) -> Investigation {
     let snap = Snapshot::collect();
     let readings = snap.readings();
+    let meters = snap.meters();
+    let failed_units = snap.failed_units.clone();
+    let docker = snap.docker.clone();
     let mut findings = rules::evaluate(&snap);
     let mut skipped = snap.skipped;
 
@@ -57,6 +70,9 @@ pub fn investigate(opts: &LogOptions) -> Investigation {
         host: host::collect(),
         since: logs.since,
         readings,
+        meters,
+        failed_units,
+        docker,
         findings,
         log_sources: logs.sources,
         log_lines_scanned: logs.lines_scanned,

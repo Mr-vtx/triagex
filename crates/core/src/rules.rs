@@ -1,9 +1,11 @@
 use crate::{
     Snapshot,
+    collectors::docker::ContainerInfo,
     finding::{Finding, Severity},
     util::human_bytes,
 };
 
+// Thresholds live here so the rules stay transparent and easy to audit.
 pub const LOAD_WARN: f64 = 1.0;
 pub const LOAD_CRIT: f64 = 2.0;
 pub const MEM_AVAILABLE_WARN_PCT: f64 = 15.0;
@@ -16,7 +18,7 @@ pub const INODE_WARN_PCT: f64 = 80.0;
 pub const INODE_CRIT_PCT: f64 = 90.0;
 
 /// Severity for "higher is worse" readings.
-fn high(value: f64, warn: f64, crit: f64) -> Option<Severity> {
+pub fn high(value: f64, warn: f64, crit: f64) -> Option<Severity> {
     if value >= crit {
         Some(Severity::Critical)
     } else if value >= warn {
@@ -166,8 +168,79 @@ pub fn evaluate(snap: &Snapshot) -> Vec<Finding> {
         }
     }
 
+    if let Some(docker) = &snap.docker {
+        for c in &docker.containers {
+            docker_findings(c, &mut out);
+        }
+    }
+
     out.sort_by(|a, b| b.severity.cmp(&a.severity).then_with(|| a.id.cmp(&b.id)));
     out
+}
+
+fn docker_findings(c: &ContainerInfo, out: &mut Vec<Finding>) {
+    let name = &c.name;
+    let logs = format!("docker logs --tail 50 {name}");
+    let code = c.exit_code.map_or("unknown".to_string(), |v| v.to_string());
+
+    if c.oom_killed {
+        out.push(finding(
+            &format!("docker.oom:{name}"),
+            Severity::Critical,
+            &format!("Container {name} was killed for running out of memory"),
+            format!(
+                "Docker recorded an out-of-memory kill (state {}, exit code {code}).",
+                c.state
+            ),
+            &format!(
+                "Check its limit and usage with: docker stats --no-stream {name}. Then look for a leak: {logs}"
+            ),
+            "docker",
+        ));
+    } else if c.state == "restarting" {
+        out.push(finding(
+            &format!("docker.restarting:{name}"),
+            Severity::Warning,
+            &format!("Container {name} keeps restarting"),
+            format!("State is restarting; restart count {}.", c.restart_count),
+            &format!("See why it exits: {logs}"),
+            "docker",
+        ));
+    } else if (c.state == "exited" || c.state == "dead") && c.exit_code.unwrap_or(0) != 0 {
+        out.push(finding(
+            &format!("docker.exited:{name}"),
+            Severity::Warning,
+            &format!("Container {name} exited with an error"),
+            format!("State {}, exit code {code}.", c.state),
+            &format!("See the last output: {logs}"),
+            "docker",
+        ));
+    }
+
+    if c.health.as_deref() == Some("unhealthy") {
+        out.push(finding(
+            &format!("docker.health:{name}"),
+            Severity::Warning,
+            &format!("Container {name} is failing its health check"),
+            format!("Health status is unhealthy (status text: {}).", c.status),
+            &format!("See the recent health results: docker inspect --format '{{{{json .State.Health}}}}' {name}"),
+            "docker",
+        ));
+    }
+
+    if c.state == "running" && c.restart_count >= 3 {
+        out.push(finding(
+            &format!("docker.restarts:{name}"),
+            Severity::Warning,
+            &format!("Container {name} has restarted {} times", c.restart_count),
+            format!(
+                "It is running now, but Docker restarted it {} times.",
+                c.restart_count
+            ),
+            &format!("Find out what keeps stopping it: {logs}"),
+            "docker",
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -200,6 +273,7 @@ mod tests {
                 inodes_used: 100,
             }],
             failed_units: Some(vec![]),
+            docker: None,
             skipped: vec![],
         }
     }
@@ -304,6 +378,81 @@ mod tests {
         let mut s = healthy();
         s.failed_units = None;
         assert!(evaluate(&s).is_empty());
+    }
+
+    fn container(name: &str, state: &str) -> ContainerInfo {
+        ContainerInfo {
+            id: "abc".into(),
+            name: name.into(),
+            image: "img".into(),
+            state: state.into(),
+            status: String::new(),
+            health: None,
+            restart_count: 0,
+            exit_code: None,
+            oom_killed: false,
+        }
+    }
+
+    fn with_containers(list: Vec<ContainerInfo>) -> Snapshot {
+        let mut s = healthy();
+        s.docker = Some(crate::collectors::docker::DockerInfo {
+            socket: "/var/run/docker.sock".into(),
+            containers: list,
+        });
+        s
+    }
+
+    #[test]
+    fn healthy_containers_produce_no_findings() {
+        let mut ok = container("web", "running");
+        ok.health = Some("healthy".into());
+        let mut stopped = container("job", "exited");
+        stopped.exit_code = Some(0);
+        assert!(evaluate(&with_containers(vec![ok, stopped])).is_empty());
+    }
+
+    #[test]
+    fn restarting_container_is_flagged_with_logs_command() {
+        let mut c = container("worker", "restarting");
+        c.restart_count = 9;
+        let f = evaluate(&with_containers(vec![c]));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].id, "docker.restarting:worker");
+        assert!(f[0].next_step.contains("docker logs --tail 50 worker"));
+    }
+
+    #[test]
+    fn crashed_container_reports_the_exit_code() {
+        let mut c = container("db", "exited");
+        c.exit_code = Some(137);
+        let f = evaluate(&with_containers(vec![c]));
+        assert_eq!(f[0].id, "docker.exited:db");
+        assert!(f[0].evidence.contains("137"));
+    }
+
+    #[test]
+    fn oom_kill_is_critical_and_not_double_reported() {
+        let mut c = container("api", "exited");
+        c.exit_code = Some(137);
+        c.oom_killed = true;
+        let f = evaluate(&with_containers(vec![c]));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].id, "docker.oom:api");
+        assert_eq!(f[0].severity, Severity::Critical);
+    }
+
+    #[test]
+    fn unhealthy_and_flapping_containers_are_flagged() {
+        let mut c = container("web", "running");
+        c.health = Some("unhealthy".into());
+        c.restart_count = 4;
+        let ids: Vec<String> = evaluate(&with_containers(vec![c]))
+            .into_iter()
+            .map(|f| f.id)
+            .collect();
+        assert!(ids.contains(&"docker.health:web".to_string()));
+        assert!(ids.contains(&"docker.restarts:web".to_string()));
     }
 
     #[test]

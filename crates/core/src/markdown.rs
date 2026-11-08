@@ -135,6 +135,9 @@ mod tests {
             },
             since: Some("24h".into()),
             readings: vec!["load: 0.40 / 0.30 / 0.20 (1/5/15 min) on 2 cores".into()],
+            meters: vec![],
+            failed_units: Some(vec![]),
+            docker: None,
             findings: vec![Finding {
                 id: "disk.usage:/".into(),
                 severity: Severity::Critical,
