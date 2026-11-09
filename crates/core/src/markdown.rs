@@ -88,12 +88,15 @@ pub fn render(inv: &Investigation) -> String {
             inv.log_groups.len(),
             inv.log_groups_total
         ));
-        md.push_str("| # | Count | Program | Pattern | First seen (UTC) | Last seen (UTC) |\n");
-        md.push_str("|---|---|---|---|---|---|\n");
+        md.push_str(
+            "| # | ID | Count | Program | Pattern | First seen (UTC) | Last seen (UTC) |\n",
+        );
+        md.push_str("|---|---|---|---|---|---|---|\n");
         for (i, g) in inv.log_groups.iter().enumerate() {
             md.push_str(&format!(
-                "| {} | {} | {} | `{}` | {} | {} |\n",
+                "| {} | `{}` | {} | {} | `{}` | {} | {} |\n",
                 i + 1,
+                cell(&g.id),
                 g.count,
                 cell(&g.program),
                 cell(&g.pattern).replace('`', "'"),
@@ -138,6 +141,7 @@ mod tests {
             meters: vec![],
             failed_units: Some(vec![]),
             docker: None,
+            redis: None,
             findings: vec![Finding {
                 id: "disk.usage:/".into(),
                 severity: Severity::Critical,
@@ -150,6 +154,7 @@ mod tests {
             log_lines_scanned: 10,
             log_groups_total: 1,
             log_groups: vec![GroupView {
+                id: "api:1a2b3c4d".into(),
                 program: "api".into(),
                 pattern: "error a | b".into(),
                 count: 3,
@@ -181,5 +186,6 @@ mod tests {
         let md = render(&sample());
         assert!(md.contains("error a \\| b"));
         assert!(md.contains("| 2026-10-29 09:00:00 | - |"));
+        assert!(md.contains("`api:1a2b3c4d`"));
     }
 }

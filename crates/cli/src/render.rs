@@ -5,11 +5,15 @@ use std::fmt::Write;
 
 use triagex_core::{
     Meter,
-    collectors::docker::{ContainerInfo, DockerInfo},
+    collectors::{
+        docker::{ContainerInfo, DockerInfo},
+        redis::RedisInfo,
+    },
     finding::{Finding, Severity},
     host::{HostInfo, format_uptime},
     investigation::Investigation,
     logs::{GroupView, LogReport},
+    util::human_bytes,
 };
 
 use crate::{
@@ -111,6 +115,8 @@ fn system_panel(
     meters: &[Meter],
     failed: &Option<Vec<String>>,
     docker: &Option<DockerInfo>,
+    redis: &Option<RedisInfo>,
+    redis_bad: bool,
 ) -> String {
     let inner = ui.inner();
     let mut body = vec![
@@ -157,6 +163,27 @@ fn system_panel(
         None => ui.paint("not detected", Style::Dim),
     };
     body.push(status_row(ui, "DOCKER", &docker_state));
+
+    let redis_state = match redis {
+        Some(r) => {
+            let mark = if redis_bad {
+                ui.cross_mark()
+            } else {
+                ui.check_mark()
+            };
+            let memory = match r.memory_pct() {
+                Some(p) => format!("{p:.0}% of {} limit", human_bytes(r.max_memory)),
+                None => format!("{} used", human_bytes(r.used_memory)),
+            };
+            let sep = ui.sep();
+            format!(
+                "{mark} {} {sep} {} {sep} {} clients {sep} {memory}",
+                r.version, r.role, r.connected_clients
+            )
+        }
+        None => ui.paint("not detected", Style::Dim),
+    };
+    body.push(status_row(ui, "REDIS", &redis_state));
 
     ui.panel("system", &host.hostname, &body)
 }
@@ -208,6 +235,7 @@ fn findings_panel(ui: &Ui, findings: &[Finding], max: Option<usize>) -> String {
         ));
         body.extend(ui.field_lines("evidence", &f.evidence, 7, inner));
         body.extend(ui.field_lines("next", &f.next_step, 7, inner));
+        body.extend(ui.field_lines("id", &f.id, 7, inner));
     }
     if findings.len() > shown {
         body.push(String::new());
@@ -326,6 +354,7 @@ fn group_lines(ui: &Ui, rank: usize, g: &GroupView, show_sample: bool) -> Vec<St
             )
         ));
     }
+    lines.extend(ui.field_lines("id", &g.id, 4, inner));
     if show_sample {
         lines.extend(ui.field_lines("e.g.", &g.sample, 4, inner));
     }
@@ -426,6 +455,8 @@ pub fn overview(
         &inv.meters,
         &inv.failed_units,
         &inv.docker,
+        &inv.redis,
+        has_redis_finding(&inv.findings),
     ));
     out.push_str(&findings_panel(ui, &inv.findings, max_findings));
     out.push_str(&docker_panel_if_any(
@@ -468,18 +499,32 @@ pub fn overview(
     out
 }
 
+fn has_redis_finding(findings: &[Finding]) -> bool {
+    findings.iter().any(|f| f.id.starts_with("redis."))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn check(
     ui: &Ui,
     host: &HostInfo,
     meters: &[Meter],
     failed: &Option<Vec<String>>,
     docker: &Option<DockerInfo>,
+    redis: &Option<RedisInfo>,
     findings: &[Finding],
     skipped: &[String],
 ) -> String {
     let mut out = String::new();
     title_line(ui, &host.hostname, &mut out);
-    out.push_str(&system_panel(ui, host, meters, failed, docker));
+    out.push_str(&system_panel(
+        ui,
+        host,
+        meters,
+        failed,
+        docker,
+        redis,
+        has_redis_finding(findings),
+    ));
     out.push_str(&findings_panel(ui, findings, None));
     out.push_str(&docker_panel_if_any(ui, docker, None));
     out.push_str(&skipped_panel(ui, skipped));
@@ -633,6 +678,25 @@ mod tests {
                 },
             ],
             failed_units: Some(vec!["nginx.service".into()]),
+            redis: Some(RedisInfo {
+                addr: "127.0.0.1:6379".into(),
+                version: "7.2.4".into(),
+                role: "master".into(),
+                uptime_secs: 100,
+                connected_clients: 12,
+                max_clients: Some(10000),
+                used_memory: 90 * 1024 * 1024,
+                max_memory: 100 * 1024 * 1024,
+                rss: 100 * 1024 * 1024,
+                fragmentation_ratio: Some(1.1),
+                evicted_keys: 0,
+                rejected_connections: 0,
+                keys: 10,
+                rdb_save_ok: Some(true),
+                aof_write_ok: Some(true),
+                master_link_up: None,
+                ping_ms: 0.2,
+            }),
             docker: Some(DockerInfo {
                 socket: "/var/run/docker.sock".into(),
                 containers: vec![fine, broken],
@@ -651,6 +715,7 @@ mod tests {
             log_lines_scanned: 0,
             log_groups_total: 1,
             log_groups: vec![GroupView {
+                id: "sshd:5e1f0c2a".into(),
                 program: "sshd".into(),
                 pattern: "Failed password for invalid user <user> from <ip> port <n> ssh2".into(),
                 count: 420,
@@ -709,6 +774,8 @@ mod tests {
             "nginx.service",
             "restarting, 7x",
             "healthy",
+            "disk.usage:/",
+            "sshd:5e1f0c2a",
         ] {
             assert!(text.contains(needle), "missing {needle}");
         }
@@ -720,6 +787,18 @@ mod tests {
         let worker = text.find("worker").unwrap();
         let web = text.rfind("web").unwrap();
         assert!(worker < web);
+    }
+
+    #[test]
+    fn redis_shows_a_status_row_and_flags_trouble() {
+        let text = overview(&ui(false, 80), &sample(), Some(5), false, false);
+        assert!(text.contains("REDIS"));
+        assert!(text.contains("7.2.4 · master · 12 clients · 90% of 100.0 MiB limit"));
+
+        let mut inv = sample();
+        inv.redis = None;
+        let text = overview(&ui(false, 80), &inv, Some(5), false, false);
+        assert!(text.contains("not detected"));
     }
 
     #[test]

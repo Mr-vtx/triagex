@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::{
     Meter, Snapshot,
-    collectors::docker::DockerInfo,
+    collectors::{docker::DockerInfo, redis::RedisInfo},
     finding::{Finding, Severity},
     host::{self, HostInfo},
     logs::{GroupView, LogOptions, analyze},
@@ -28,6 +28,8 @@ pub struct Investigation {
     pub failed_units: Option<Vec<String>>,
     /// None means Docker is not installed here (or could not be queried).
     pub docker: Option<DockerInfo>,
+    /// None means no Redis was found (or it could not be queried).
+    pub redis: Option<RedisInfo>,
     pub findings: Vec<Finding>,
     pub log_sources: Vec<String>,
     pub log_lines_scanned: u64,
@@ -55,6 +57,7 @@ pub fn investigate(opts: &LogOptions) -> Investigation {
     let meters = snap.meters();
     let failed_units = snap.failed_units.clone();
     let docker = snap.docker.clone();
+    let redis = snap.redis.clone();
     let mut findings = rules::evaluate(&snap);
     let mut skipped = snap.skipped;
 
@@ -73,6 +76,7 @@ pub fn investigate(opts: &LogOptions) -> Investigation {
         meters,
         failed_units,
         docker,
+        redis,
         findings,
         log_sources: logs.sources,
         log_lines_scanned: logs.lines_scanned,

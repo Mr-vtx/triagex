@@ -48,6 +48,8 @@ impl Default for LogOptions {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupView {
+    /// Stable id (program + hash of the pattern); the same id appears in JSON, Markdown and the terminal.
+    pub id: String,
     pub program: String,
     pub pattern: String,
     pub count: u64,
@@ -122,6 +124,7 @@ struct Ingest<'a> {
 impl Ingest<'_> {
     fn line(&mut self, raw: &str, default_program: &str) {
         self.scanned += 1;
+        // Empty lines, journal headers and indented continuation lines (stack frames) are noise.
         if raw.trim().is_empty() || raw.starts_with("-- ") || raw.starts_with([' ', '\t']) {
             return;
         }
@@ -145,6 +148,11 @@ fn file_label(path: &std::path::Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "log".to_string())
+}
+
+/// Stable across runs: the same program and message pattern always give the same id.
+pub fn group_id(program: &str, pattern: &str) -> String {
+    format!("{program}:{}", short_hash(pattern))
 }
 
 fn short_hash(s: &str) -> String {
@@ -200,7 +208,7 @@ pub fn findings_from_groups(groups: &[LogGroup]) -> Vec<Finding> {
             continue;
         }
         out.push(Finding {
-            id: format!("log.repeat:{}:{}", g.program, short_hash(&g.pattern)),
+            id: format!("log.repeat:{}", group_id(&g.program, &g.pattern)),
             severity: if g.count >= 1000 {
                 Severity::Critical
             } else {
@@ -307,6 +315,7 @@ pub fn analyze(opts: &LogOptions) -> LogReport {
         .iter()
         .take(opts.top)
         .map(|g| GroupView {
+            id: group_id(&g.program, &g.pattern),
             program: g.program.clone(),
             pattern: g.pattern.clone(),
             count: g.count,
@@ -400,7 +409,7 @@ mod tests {
         std::fs::remove_file(path).ok();
 
         assert_eq!(report.lines_scanned, 32);
-        assert_eq!(report.lines_matched, 31); // a successful login is not a problem line
+        assert_eq!(report.lines_matched, 31); // the successful login is not a problem line
         assert_eq!(report.groups_total, 2);
         assert_eq!(report.groups[0].count, 30);
         assert_eq!(
@@ -475,6 +484,35 @@ mod tests {
             .find(|f| f.id.starts_with("log.repeat:api:"))
             .expect("repeat finding");
         assert_eq!(f.severity, Severity::Warning);
+    }
+
+    #[test]
+    fn group_ids_match_their_findings_and_are_stable() {
+        let mut text = String::new();
+        for i in 0..150 {
+            text.push_str(&format!(
+                "Oct 26 05:{:02}:{:02} vps api[1]: error upstream timed out after {} ms\n",
+                i / 60,
+                i % 60,
+                1000 + i
+            ));
+        }
+        let path = temp_log(&text);
+        let first = analyze(&file_only(path.clone()));
+        let second = analyze(&file_only(path.clone()));
+        std::fs::remove_file(path).ok();
+
+        let gid = first.groups[0].id.clone();
+        assert!(gid.starts_with("api:"));
+        assert_eq!(gid, second.groups[0].id);
+        assert!(
+            first
+                .findings
+                .iter()
+                .any(|f| f.id == format!("log.repeat:{gid}"))
+        );
+        assert_eq!(group_id("api", "x"), group_id("api", "x"));
+        assert_ne!(group_id("api", "x"), group_id("api", "y"));
     }
 
     #[test]

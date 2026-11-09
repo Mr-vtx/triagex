@@ -281,6 +281,7 @@ fn system_check(ui: &Ui, json: bool) -> ExitCode {
                 &snap.meters(),
                 &snap.failed_units,
                 &snap.docker,
+                &snap.redis,
                 &findings,
                 &snap.skipped
             )

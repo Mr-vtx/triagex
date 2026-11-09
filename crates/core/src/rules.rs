@@ -1,6 +1,6 @@
 use crate::{
     Snapshot,
-    collectors::docker::ContainerInfo,
+    collectors::{docker::ContainerInfo, redis::RedisInfo},
     finding::{Finding, Severity},
     util::human_bytes,
 };
@@ -16,6 +16,13 @@ pub const DISK_WARN_PCT: f64 = 80.0;
 pub const DISK_CRIT_PCT: f64 = 90.0;
 pub const INODE_WARN_PCT: f64 = 80.0;
 pub const INODE_CRIT_PCT: f64 = 90.0;
+pub const REDIS_MEM_WARN_PCT: f64 = 85.0;
+pub const REDIS_MEM_CRIT_PCT: f64 = 95.0;
+pub const REDIS_FRAGMENTATION_WARN: f64 = 1.5;
+pub const REDIS_CLIENTS_WARN_PCT: f64 = 90.0;
+pub const REDIS_PING_WARN_MS: f64 = 100.0;
+/// Fragmentation ratios are noisy on tiny datasets, so only judge Redis above this size.
+const REDIS_FRAGMENTATION_MIN_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Severity for "higher is worse" readings.
 pub fn high(value: f64, warn: f64, crit: f64) -> Option<Severity> {
@@ -174,8 +181,160 @@ pub fn evaluate(snap: &Snapshot) -> Vec<Finding> {
         }
     }
 
+    if let Some(redis) = &snap.redis {
+        redis_findings(redis, &mut out);
+    }
+
     out.sort_by(|a, b| b.severity.cmp(&a.severity).then_with(|| a.id.cmp(&b.id)));
     out
+}
+
+fn redis_findings(r: &RedisInfo, out: &mut Vec<Finding>) {
+    let source = "redis INFO";
+
+    if let Some((pct, sev)) = level(r.memory_pct(), REDIS_MEM_WARN_PCT, REDIS_MEM_CRIT_PCT) {
+        out.push(finding(
+            "redis.memory",
+            sev,
+            "Redis is close to its memory limit",
+            format!(
+                "{pct:.1}% of maxmemory in use ({} of {}).",
+                human_bytes(r.used_memory),
+                human_bytes(r.max_memory)
+            ),
+            "Check the eviction policy and biggest keys: redis-cli config get maxmemory-policy; redis-cli --bigkeys",
+            source,
+        ));
+    }
+
+    if r.evicted_keys > 0 {
+        out.push(finding(
+            "redis.evictions",
+            Severity::Warning,
+            "Redis has been evicting keys",
+            format!(
+                "{} keys evicted since the server started (maxmemory is {}).",
+                r.evicted_keys,
+                if r.max_memory == 0 {
+                    "not set".to_string()
+                } else {
+                    human_bytes(r.max_memory)
+                }
+            ),
+            "Data is being dropped to stay under the memory limit. Raise maxmemory or review the policy: redis-cli config get maxmemory-policy",
+            source,
+        ));
+    }
+
+    match r.fragmentation_ratio {
+        Some(ratio)
+            if r.rss >= REDIS_FRAGMENTATION_MIN_BYTES && ratio >= REDIS_FRAGMENTATION_WARN =>
+        {
+            out.push(finding(
+                "redis.fragmentation",
+                Severity::Warning,
+                "Redis memory is heavily fragmented",
+                format!(
+                    "Fragmentation ratio {ratio:.2}: the process uses {} of RAM for {} of data.",
+                    human_bytes(r.rss),
+                    human_bytes(r.used_memory)
+                ),
+                "Consider active defragmentation (redis-cli config set activedefrag yes) or a restart in a quiet window.",
+                source,
+            ));
+        }
+        Some(ratio) if r.used_memory >= REDIS_FRAGMENTATION_MIN_BYTES && ratio < 1.0 => {
+            out.push(finding(
+                "redis.swapping",
+                Severity::Warning,
+                "Redis may be swapping to disk",
+                format!(
+                    "Fragmentation ratio {ratio:.2} is below 1.0, which usually means part of Redis's memory is in swap."
+                ),
+                "Check swap use with: free -h. Redis latency suffers badly when it swaps.",
+                source,
+            ));
+        }
+        _ => {}
+    }
+
+    if r.rejected_connections > 0 {
+        out.push(finding(
+            "redis.rejected",
+            Severity::Warning,
+            "Redis has rejected connections",
+            format!(
+                "{} connections were refused since the server started (maxclients {}).",
+                r.rejected_connections,
+                r.max_clients.map_or("unknown".to_string(), |m| m.to_string())
+            ),
+            "Clients hit the connection limit. Look for leaks: redis-cli client list | wc -l, or raise maxclients.",
+            source,
+        ));
+    }
+
+    if let Some(max) = r.max_clients.filter(|m| *m > 0) {
+        let pct = r.connected_clients as f64 / max as f64 * 100.0;
+        if pct >= REDIS_CLIENTS_WARN_PCT {
+            out.push(finding(
+                "redis.clients",
+                Severity::Warning,
+                "Redis is nearly out of client slots",
+                format!(
+                    "{} of {max} client connections in use ({pct:.0}%).",
+                    r.connected_clients
+                ),
+                "Find who is connected: redis-cli client list",
+                source,
+            ));
+        }
+    }
+
+    if r.rdb_save_ok == Some(false) {
+        out.push(finding(
+            "redis.persistence.rdb",
+            Severity::Critical,
+            "Redis's last background save failed",
+            "rdb_last_bgsave_status is err, so a restart could lose recent data.".to_string(),
+            "Check disk space and permissions (df -h) and the Redis log, then retry: redis-cli bgsave",
+            source,
+        ));
+    }
+    if r.aof_write_ok == Some(false) {
+        out.push(finding(
+            "redis.persistence.aof",
+            Severity::Critical,
+            "Redis cannot write its append-only file",
+            "aof_last_write_status is err.".to_string(),
+            "Check disk space and permissions (df -h) and the Redis log: redis-cli info persistence",
+            source,
+        ));
+    }
+
+    if r.role == "slave" && r.master_link_up == Some(false) {
+        out.push(finding(
+            "redis.replication",
+            Severity::Warning,
+            "Redis replica has lost its master",
+            "master_link_status is down.".to_string(),
+            "See the replication details: redis-cli info replication",
+            source,
+        ));
+    }
+
+    if r.ping_ms >= REDIS_PING_WARN_MS {
+        out.push(finding(
+            "redis.latency",
+            Severity::Warning,
+            "Redis is slow to answer",
+            format!(
+                "PING took {:.0} ms; on a local server it should take well under 1 ms.",
+                r.ping_ms
+            ),
+            "Look for slow commands: redis-cli slowlog get 10, and check CPU load.",
+            source,
+        ));
+    }
 }
 
 fn docker_findings(c: &ContainerInfo, out: &mut Vec<Finding>) {
@@ -274,6 +433,7 @@ mod tests {
             }],
             failed_units: Some(vec![]),
             docker: None,
+            redis: None,
             skipped: vec![],
         }
     }
@@ -453,6 +613,110 @@ mod tests {
             .collect();
         assert!(ids.contains(&"docker.health:web".to_string()));
         assert!(ids.contains(&"docker.restarts:web".to_string()));
+    }
+
+    fn redis() -> RedisInfo {
+        RedisInfo {
+            addr: "127.0.0.1:6379".into(),
+            version: "7.2.4".into(),
+            role: "master".into(),
+            uptime_secs: 1000,
+            connected_clients: 10,
+            max_clients: Some(10_000),
+            used_memory: 50 * 1024 * 1024,
+            max_memory: 0,
+            rss: 60 * 1024 * 1024,
+            fragmentation_ratio: Some(1.2),
+            evicted_keys: 0,
+            rejected_connections: 0,
+            keys: 100,
+            rdb_save_ok: Some(true),
+            aof_write_ok: Some(true),
+            master_link_up: None,
+            ping_ms: 0.3,
+        }
+    }
+
+    fn with_redis(r: RedisInfo) -> Vec<Finding> {
+        let mut s = healthy();
+        s.redis = Some(r);
+        evaluate(&s)
+    }
+
+    #[test]
+    fn a_healthy_redis_is_quiet() {
+        assert!(with_redis(redis()).is_empty());
+    }
+
+    #[test]
+    fn redis_near_its_memory_limit_warns_then_goes_critical() {
+        let mut r = redis();
+        r.max_memory = 100 * 1024 * 1024; // 50% used
+        assert!(with_redis(r.clone()).is_empty());
+        r.max_memory = 58 * 1024 * 1024; // 86%
+        assert_eq!(with_redis(r.clone())[0].severity, Severity::Warning);
+        r.max_memory = 51 * 1024 * 1024; // 98%
+        let f = with_redis(r);
+        assert_eq!(f[0].id, "redis.memory");
+        assert_eq!(f[0].severity, Severity::Critical);
+    }
+
+    #[test]
+    fn evictions_and_rejections_are_flagged() {
+        let mut r = redis();
+        r.evicted_keys = 12;
+        r.rejected_connections = 4;
+        let ids: Vec<String> = with_redis(r).into_iter().map(|f| f.id).collect();
+        assert!(ids.contains(&"redis.evictions".to_string()));
+        assert!(ids.contains(&"redis.rejected".to_string()));
+    }
+
+    #[test]
+    fn fragmentation_is_ignored_on_tiny_datasets_but_flagged_on_big_ones() {
+        let mut r = redis();
+        r.fragmentation_ratio = Some(3.0);
+        r.rss = 5 * 1024 * 1024; // tiny: ratio is noise
+        assert!(with_redis(r.clone()).is_empty());
+        r.rss = 300 * 1024 * 1024;
+        assert_eq!(with_redis(r)[0].id, "redis.fragmentation");
+    }
+
+    #[test]
+    fn a_ratio_below_one_on_a_big_dataset_suggests_swapping() {
+        let mut r = redis();
+        r.used_memory = 400 * 1024 * 1024;
+        r.rss = 300 * 1024 * 1024;
+        r.fragmentation_ratio = Some(0.75);
+        assert_eq!(with_redis(r)[0].id, "redis.swapping");
+    }
+
+    #[test]
+    fn failed_persistence_is_critical() {
+        let mut r = redis();
+        r.rdb_save_ok = Some(false);
+        r.aof_write_ok = Some(false);
+        let f = with_redis(r);
+        assert_eq!(f.len(), 2);
+        assert!(f.iter().all(|x| x.severity == Severity::Critical));
+    }
+
+    #[test]
+    fn a_replica_without_its_master_and_a_slow_ping_are_flagged() {
+        let mut r = redis();
+        r.role = "slave".into();
+        r.master_link_up = Some(false);
+        r.ping_ms = 250.0;
+        let ids: Vec<String> = with_redis(r).into_iter().map(|f| f.id).collect();
+        assert!(ids.contains(&"redis.replication".to_string()));
+        assert!(ids.contains(&"redis.latency".to_string()));
+    }
+
+    #[test]
+    fn nearly_full_client_slots_are_flagged() {
+        let mut r = redis();
+        r.max_clients = Some(100);
+        r.connected_clients = 95;
+        assert_eq!(with_redis(r)[0].id, "redis.clients");
     }
 
     #[test]

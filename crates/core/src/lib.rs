@@ -11,7 +11,9 @@ pub mod rules;
 pub mod time;
 pub mod util;
 
-use collectors::{cpu::LoadInfo, disk::DiskInfo, docker::DockerInfo, memory::MemInfo};
+use collectors::{
+    cpu::LoadInfo, disk::DiskInfo, docker::DockerInfo, memory::MemInfo, redis::RedisInfo,
+};
 use finding::{Report, Severity};
 use serde::Serialize;
 use util::human_bytes;
@@ -39,6 +41,8 @@ pub struct Snapshot {
     pub failed_units: Option<Vec<String>>,
     /// None means Docker is not installed here, or could not be queried (see `skipped`).
     pub docker: Option<DockerInfo>,
+    /// None means no Redis was found, or it could not be queried (see `skipped`).
+    pub redis: Option<RedisInfo>,
     /// Checks that could not run, with the reason. Never silently dropped.
     pub skipped: Vec<String>,
 }
@@ -85,6 +89,14 @@ impl Snapshot {
             }
         };
 
+        let redis = match collectors::redis::collect() {
+            Ok(v) => v,
+            Err(e) => {
+                skipped.push(e);
+                None
+            }
+        };
+
         Snapshot {
             hostname: hostname(),
             load,
@@ -92,6 +104,7 @@ impl Snapshot {
             disks,
             failed_units,
             docker,
+            redis,
             skipped,
         }
     }
@@ -178,6 +191,21 @@ impl Snapshot {
                 severity,
             });
         }
+        if let Some(r) = &self.redis
+            && let Some(pct) = r.memory_pct()
+        {
+            out.push(Meter {
+                label: "REDIS MEM".to_string(),
+                percent: pct.clamp(0.0, 100.0),
+                value: format!("{pct:.1}%"),
+                detail: format!(
+                    "{} of {} limit",
+                    human_bytes(r.used_memory),
+                    human_bytes(r.max_memory)
+                ),
+                severity: rules::high(pct, rules::REDIS_MEM_WARN_PCT, rules::REDIS_MEM_CRIT_PCT),
+            });
+        }
         out
     }
 
@@ -220,6 +248,19 @@ impl Snapshot {
             Some(units) if units.is_empty() => out.push("systemd: no failed units".to_string()),
             Some(units) => out.push(format!("systemd: {} failed unit(s)", units.len())),
             None => {}
+        }
+        if let Some(r) = &self.redis {
+            let limit = match r.memory_pct() {
+                Some(p) => format!("{p:.0}% of {}", human_bytes(r.max_memory)),
+                None => "no memory limit".to_string(),
+            };
+            out.push(format!(
+                "redis: {} {}, {} clients, {} used ({limit})",
+                r.version,
+                r.role,
+                r.connected_clients,
+                human_bytes(r.used_memory)
+            ));
         }
         if let Some(d) = &self.docker {
             out.push(format!(
@@ -282,6 +323,7 @@ mod tests {
             }],
             failed_units: Some(vec![]),
             docker: None,
+            redis: None,
             skipped: vec![],
         }
     }
