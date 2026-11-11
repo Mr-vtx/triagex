@@ -1,9 +1,10 @@
-//! Triagex core collects system facts, apply transparent rules and emit findings.
-//! It is Read-only, the crate never modifies the system it inspects
+//! Triagex core: collect system facts, apply transparent rules, emit findings.
+//! Read-only: this crate never modifies the system it inspects.
 
 pub mod collectors;
 pub mod finding;
 pub mod host;
+pub mod integrity;
 pub mod investigation;
 pub mod logs;
 pub mod markdown;

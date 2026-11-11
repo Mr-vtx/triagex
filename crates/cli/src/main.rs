@@ -9,7 +9,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use triagex_core::{
     Snapshot,
     finding::{Finding, Severity},
-    investigation::investigate,
+    integrity::{self, DEFAULT_MAX_FILES, DEFAULT_MAX_HASH_MB, ScanOptions},
+    investigation::{Investigation, investigate},
     logs::{LogOptions, analyze},
     markdown, rules,
     time::parse_duration,
@@ -79,6 +80,45 @@ enum Commands {
         /// How many log groups to include
         #[arg(long, default_value_t = 15)]
         top: usize,
+        /// Also compare against a file-integrity baseline (default name: "default")
+        #[arg(long, num_args = 0..=1, default_missing_value = "default", value_name = "NAME")]
+        verify: Option<String>,
+    },
+    /// Record hashes, permissions and owners of files, to compare against later
+    Baseline {
+        /// Files or directories to watch
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Name for this baseline
+        #[arg(long, default_value = "default")]
+        name: String,
+        /// Skip paths matching this glob or directory (repeatable)
+        #[arg(long = "exclude")]
+        excludes: Vec<String>,
+        /// Files larger than this are tracked by size only
+        #[arg(long, default_value_t = DEFAULT_MAX_HASH_MB)]
+        max_hash_mb: u64,
+        /// Stop after recording this many paths
+        #[arg(long, default_value_t = DEFAULT_MAX_FILES)]
+        max_files: usize,
+        /// Replace an existing baseline of the same name
+        #[arg(long)]
+        force: bool,
+        /// Print a JSON summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare files against a baseline (exit code: 0 ok, 1 warnings, 2 critical)
+    Verify {
+        /// Which baseline to compare against
+        #[arg(long, default_value = "default")]
+        name: String,
+        /// The digest you recorded when you created the baseline
+        #[arg(long)]
+        expect_digest: Option<String>,
+        /// Print the result as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Run only the system checks (exit code: 0 ok, 1 warnings, 2 critical)
     Check {
@@ -132,7 +172,31 @@ fn main() -> ExitCode {
             files,
             since,
             top,
-        }) => report(&ui, format, output, files, &since, top),
+            verify,
+        }) => report(&ui, format, output, files, &since, top, verify),
+        Some(Commands::Baseline {
+            paths,
+            name,
+            excludes,
+            max_hash_mb,
+            max_files,
+            force,
+            json,
+        }) => baseline(
+            &ui,
+            paths,
+            &name,
+            excludes,
+            max_hash_mb,
+            max_files,
+            force,
+            json,
+        ),
+        Some(Commands::Verify {
+            name,
+            expect_digest,
+            json,
+        }) => verify_cmd(&ui, &name, expect_digest.as_deref(), json),
         Some(Commands::Check { json }) => system_check(&ui, json),
         Some(Commands::Logs {
             files,
@@ -217,6 +281,7 @@ fn report(
     files: Vec<PathBuf>,
     since: &str,
     top: usize,
+    verify: Option<String>,
 ) -> ExitCode {
     let since_secs = match parse_since(since) {
         Ok(s) => s,
@@ -227,7 +292,7 @@ fn report(
         return ExitCode::from(3);
     }
 
-    let inv = investigate(&LogOptions {
+    let mut inv = investigate(&LogOptions {
         use_defaults: files.is_empty(),
         files,
         journal: false,
@@ -235,6 +300,9 @@ fn report(
         all_lines: false,
         top,
     });
+    if let Some(name) = verify {
+        attach_integrity(&mut inv, &name);
+    }
 
     let rendered = match format {
         Format::Text => {
@@ -262,6 +330,102 @@ fn report(
         None => println!("{rendered}"),
     }
     exit_for(inv.worst())
+}
+
+/// Compare against a baseline and fold the result into the report. A missing baseline is
+/// noted in the report instead of failing it.
+fn attach_integrity(inv: &mut Investigation, name: &str) {
+    let result = integrity::baseline_path(&integrity::data_dir(), name)
+        .and_then(|path| integrity::load_baseline(&path));
+    match result {
+        Ok(base) => {
+            let r = integrity::verify_baseline(name, &base, None);
+            inv.findings.extend(r.findings.clone());
+            inv.findings
+                .sort_by(|a, b| b.severity.cmp(&a.severity).then_with(|| a.id.cmp(&b.id)));
+            inv.integrity = Some(r);
+        }
+        Err(e) => inv.skipped.push(format!("integrity: {e}")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn baseline(
+    ui: &Ui,
+    paths: Vec<PathBuf>,
+    name: &str,
+    mut excludes: Vec<String>,
+    max_hash_mb: u64,
+    max_files: usize,
+    force: bool,
+    json: bool,
+) -> ExitCode {
+    let data_dir = integrity::data_dir();
+    let path = match integrity::baseline_path(&data_dir, name) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("triagex: {e}");
+            return ExitCode::from(3);
+        }
+    };
+    if path.exists() && !force {
+        eprintln!(
+            "triagex: a baseline named \"{name}\" already exists at {} (use --force to replace it)",
+            path.display()
+        );
+        return ExitCode::from(3);
+    }
+    // Never baseline the baselines themselves.
+    excludes.push(data_dir.to_string_lossy().into_owned());
+
+    let mut opts = ScanOptions::new(paths);
+    opts.excludes = excludes;
+    opts.max_files = max_files;
+    opts.max_hash_bytes = max_hash_mb.saturating_mul(1024 * 1024);
+
+    let base = integrity::create_baseline(&opts);
+    if base.entries.is_empty() {
+        eprintln!("triagex: nothing was recorded (are the paths correct and readable?)");
+        for s in base.skipped.iter().take(5) {
+            eprintln!("  {} ({})", s.path, s.reason);
+        }
+        return ExitCode::from(3);
+    }
+    if let Err(e) = integrity::save_baseline(&path, &base, force) {
+        eprintln!("triagex: {e}");
+        return ExitCode::from(3);
+    }
+
+    let summary = integrity::summarize(name, &path, &base);
+    if json {
+        if let Err(code) = print_json(&summary) {
+            return code;
+        }
+    } else {
+        print!("{}", render::baseline_screen(ui, &summary));
+    }
+    ExitCode::SUCCESS
+}
+
+fn verify_cmd(ui: &Ui, name: &str, expect_digest: Option<&str>, json: bool) -> ExitCode {
+    let loaded = integrity::baseline_path(&integrity::data_dir(), name)
+        .and_then(|path| integrity::load_baseline(&path));
+    let base = match loaded {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("triagex: {e}");
+            return ExitCode::from(3);
+        }
+    };
+    let report = integrity::verify_baseline(name, &base, expect_digest);
+    if json {
+        if let Err(code) = print_json(&report) {
+            return code;
+        }
+    } else {
+        print!("{}", render::verify_screen(ui, &report));
+    }
+    exit_for(worst(&report.findings))
 }
 
 fn system_check(ui: &Ui, json: bool) -> ExitCode {

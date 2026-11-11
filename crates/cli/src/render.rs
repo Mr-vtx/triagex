@@ -11,6 +11,7 @@ use triagex_core::{
     },
     finding::{Finding, Severity},
     host::{HostInfo, format_uptime},
+    integrity::{BaselineSummary, VerifyReport},
     investigation::Investigation,
     logs::{GroupView, LogReport},
     util::human_bytes,
@@ -464,6 +465,9 @@ pub fn overview(
         &inv.docker,
         max_findings.map(|_| 8),
     ));
+    if let Some(r) = &inv.integrity {
+        out.push_str(&integrity_panel(ui, r));
+    }
 
     if !inv.log_groups.is_empty() {
         let window = inv
@@ -496,6 +500,186 @@ pub fn overview(
             &mut out,
         );
     }
+    out
+}
+
+fn path_list(ui: &Ui, title: &str, paths: &[String], inner: usize, body: &mut Vec<String>) {
+    if paths.is_empty() {
+        return;
+    }
+    body.push(String::new());
+    body.push(ui.paint(&format!("{title} ({})", paths.len()), Style::Bold));
+    for p in paths.iter().take(8) {
+        body.push(format!(
+            "  {}",
+            ui.paint(&ui.truncate(p, inner.saturating_sub(2)), Style::Dim)
+        ));
+    }
+    if paths.len() > 8 {
+        body.push(ui.paint(&format!("  ... and {} more", paths.len() - 8), Style::Dim));
+    }
+}
+
+fn integrity_panel(ui: &Ui, r: &VerifyReport) -> String {
+    let inner = ui.inner();
+    let mut body = Vec::new();
+    let mut kv = |label: &str, text: &str| body.extend(ui.field_lines(label, text, 0, inner));
+
+    kv(
+        "baseline",
+        &format!(
+            "{} (created {} UTC on {})",
+            r.name,
+            short_time(&r.created_at),
+            r.hostname
+        ),
+    );
+    kv("watching", &r.roots.join(", "));
+    kv(
+        "checked",
+        &format!(
+            "{} paths now, {} in the baseline",
+            r.checked, r.baseline_entries
+        ),
+    );
+    let digest_state = if r.digest_ok {
+        format!("{} matches the digest stored with it", ui.check_mark())
+    } else {
+        format!(
+            "{} DOES NOT MATCH: the baseline was edited or damaged",
+            ui.cross_mark()
+        )
+    };
+    kv("digest", &digest_state);
+    if let Some(ok) = r.expected_digest_ok {
+        let text = if ok {
+            format!("{} matches the digest you passed", ui.check_mark())
+        } else {
+            format!("{} differs from the digest you passed", ui.cross_mark())
+        };
+        kv("expected", &text);
+    }
+    body.push(String::new());
+
+    if r.changes() == 0 {
+        body.push(format!(
+            "{} {}",
+            ui.check_mark(),
+            ui.paint("No changes since the baseline.", Style::Bold)
+        ));
+    } else {
+        let count = |n: usize, word: &str| {
+            let text = format!("{word} {n}");
+            ui.paint(&text, if n > 0 { Style::Warn } else { Style::Dim })
+        };
+        body.push(
+            [
+                count(r.modified.len(), "modified"),
+                count(r.added.len(), "added"),
+                count(r.deleted.len(), "deleted"),
+                count(r.permissions.len(), "permissions"),
+                count(r.type_changed.len(), "type"),
+            ]
+            .join(&format!("  {}  ", ui.sep())),
+        );
+    }
+
+    path_list(ui, "MODIFIED", &r.modified, inner, &mut body);
+    path_list(ui, "ADDED", &r.added, inner, &mut body);
+    path_list(ui, "DELETED", &r.deleted, inner, &mut body);
+    path_list(ui, "CHANGED TYPE", &r.type_changed, inner, &mut body);
+    let perms: Vec<String> = r
+        .permissions
+        .iter()
+        .map(|c| format!("{} ({:04o} -> {:04o})", c.path, c.old_mode, c.new_mode))
+        .collect();
+    path_list(ui, "PERMISSIONS OR OWNER", &perms, inner, &mut body);
+    let unreadable: Vec<String> = r
+        .unreadable
+        .iter()
+        .map(|s| format!("{} ({})", s.path, s.reason))
+        .collect();
+    path_list(ui, "COULD NOT CHECK", &unreadable, inner, &mut body);
+
+    let right = if r.changes() == 0 {
+        "unchanged".to_string()
+    } else {
+        format!("{} changes", r.changes())
+    };
+    ui.panel("file integrity", &right, &body)
+}
+
+pub fn verify_screen(ui: &Ui, r: &VerifyReport) -> String {
+    let mut out = String::new();
+    title_line(ui, &format!("verify {} {}", ui.sep(), r.hostname), &mut out);
+    out.push_str(&integrity_panel(ui, r));
+    if !r.findings.is_empty() {
+        out.push_str(&findings_panel(ui, &r.findings, None));
+    }
+    line!(out, "{}", summary_line(ui, &r.findings));
+    out
+}
+
+pub fn baseline_screen(ui: &Ui, b: &BaselineSummary) -> String {
+    let inner = ui.inner();
+    let mut body = Vec::new();
+    let mut kv = |label: &str, text: &str| body.extend(ui.field_lines(label, text, 0, inner));
+
+    kv("saved to", &b.path);
+    kv("watching", &b.roots.join(", "));
+    kv(
+        "recorded",
+        &format!(
+            "{} files ({} hashed), {} directories, {} symlinks",
+            b.files, b.hashed, b.dirs, b.symlinks
+        ),
+    );
+    kv("digest", &b.digest);
+    if b.skipped_total > 0 {
+        body.push(String::new());
+        body.push(ui.paint(
+            &format!("{} path(s) could not be recorded", b.skipped_total),
+            Style::Warn,
+        ));
+        for s in b.skipped.iter().take(5) {
+            let line = format!("{} ({})", s.path, s.reason);
+            body.push(format!(
+                "  {}",
+                ui.paint(&ui.truncate(&line, inner.saturating_sub(2)), Style::Dim)
+            ));
+        }
+        if b.skipped_total > 5 {
+            body.push(ui.paint(
+                &format!("  ... and {} more", b.skipped_total - 5),
+                Style::Dim,
+            ));
+        }
+    }
+
+    let mut out = String::new();
+    title_line(ui, &format!("baseline {} {}", ui.sep(), b.name), &mut out);
+    out.push_str(&ui.panel(
+        "baseline saved",
+        &b.created_at.replace('T', " ").replace('Z', " UTC"),
+        &body,
+    ));
+    dim_wrapped(
+        ui,
+        "Keep the digest somewhere off this server. Later, `triagex verify --expect-digest <digest>` proves this baseline was not edited.",
+        &mut out,
+    );
+    if b.skipped_total > 0 {
+        dim_wrapped(
+            ui,
+            "Some paths were unreadable. Run with sudo to include them, or leave them out with --exclude.",
+            &mut out,
+        );
+    }
+    dim_wrapped(
+        ui,
+        &format!("Compare later with: triagex verify --name {}", b.name),
+        &mut out,
+    );
     out
 }
 
@@ -678,6 +862,7 @@ mod tests {
                 },
             ],
             failed_units: Some(vec!["nginx.service".into()]),
+            integrity: None,
             redis: Some(RedisInfo {
                 addr: "127.0.0.1:6379".into(),
                 version: "7.2.4".into(),
@@ -859,6 +1044,127 @@ mod tests {
             false,
         );
         assert!(tight.lines().count() < spaced.lines().count());
+    }
+
+    fn verify_report() -> VerifyReport {
+        VerifyReport {
+            name: "web".into(),
+            created_at: "2026-11-10T08:00:00Z".into(),
+            hostname: "myvps".into(),
+            roots: vec!["/etc".into(), "/usr/local/bin".into()],
+            baseline_entries: 1200,
+            checked: 1203,
+            digest_ok: true,
+            digest: "a".repeat(64),
+            expected_digest_ok: Some(true),
+            added: vec!["/etc/new.conf".into()],
+            deleted: vec![],
+            modified: (0..12).map(|i| format!("/etc/changed-{i}.conf")).collect(),
+            permissions: vec![triagex_core::integrity::PermChange {
+                path: "/usr/local/bin/tool".into(),
+                old_mode: 0o755,
+                new_mode: 0o4755,
+                old_owner: (0, 0),
+                new_owner: (0, 0),
+            }],
+            type_changed: vec![],
+            unreadable: vec![],
+            findings: vec![Finding {
+                id: "integrity.permissions.risky".into(),
+                severity: Severity::Critical,
+                title: "1 file(s) gained setuid, setgid or world-write".into(),
+                evidence: "/usr/local/bin/tool (0755 -> 4755)".into(),
+                next_step: "chmod u-s /usr/local/bin/tool".into(),
+                source: "baseline comparison".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn verify_screen_lists_changes_and_findings_and_fits_every_width() {
+        let r = verify_report();
+        for width in [40usize, 60, 80, 100] {
+            let text = verify_screen(&ui(false, width), &r);
+            for l in text.lines() {
+                assert!(visible_width(l) <= width, "width {width}: {l:?}");
+            }
+        }
+        let text = verify_screen(&ui(false, 80), &r);
+        for needle in [
+            "file integrity",
+            "14 changes",
+            "modified 12",
+            "added 1",
+            "/etc/new.conf",
+            "... and 4 more",
+            "0755 -> 4755",
+            "matches the digest stored",
+            "[CRIT]",
+            "integrity.permissions.risky",
+        ] {
+            assert!(text.contains(needle), "missing {needle}\n{text}");
+        }
+    }
+
+    #[test]
+    fn a_clean_verify_and_a_tampered_baseline_read_clearly() {
+        let mut clean = verify_report();
+        clean.added.clear();
+        clean.modified.clear();
+        clean.permissions.clear();
+        clean.findings.clear();
+        let text = verify_screen(&ui(false, 80), &clean);
+        assert!(text.contains("No changes since the baseline."));
+        assert!(text.contains("unchanged"));
+
+        let mut bad = verify_report();
+        bad.digest_ok = false;
+        bad.expected_digest_ok = Some(false);
+        let text = verify_screen(&ui(false, 80), &bad);
+        assert!(text.contains("DOES NOT MATCH"));
+        assert!(text.contains("differs from the digest you passed"));
+    }
+
+    #[test]
+    fn the_report_overview_includes_integrity_when_present() {
+        let mut inv = sample();
+        inv.integrity = Some(verify_report());
+        let text = overview(&ui(false, 80), &inv, None, false, false);
+        assert!(text.contains("file integrity"));
+        let none = overview(&ui(false, 80), &sample(), None, false, false);
+        assert!(!none.contains("file integrity"));
+    }
+
+    #[test]
+    fn baseline_screen_shows_the_digest_and_what_to_do_with_it() {
+        let b = BaselineSummary {
+            name: "web".into(),
+            path: "/var/lib/triagex/baselines/web.json".into(),
+            created_at: "2026-11-10T08:00:00Z".into(),
+            roots: vec!["/etc".into()],
+            files: 1200,
+            dirs: 90,
+            symlinks: 12,
+            hashed: 1198,
+            skipped_total: 7,
+            skipped: vec![triagex_core::integrity::Skipped {
+                path: "/etc/shadow".into(),
+                reason: "permission denied".into(),
+            }],
+            digest: "b".repeat(64),
+        };
+        for width in [40usize, 80, 100] {
+            for l in baseline_screen(&ui(false, width), &b).lines() {
+                assert!(visible_width(l) <= width, "width {width}: {l:?}");
+            }
+        }
+        let text = baseline_screen(&ui(false, 100), &b);
+        assert!(text.contains(&"b".repeat(64)));
+        assert!(text.contains("1200 files (1198 hashed)"));
+        assert!(text.contains("7 path(s) could not be recorded"));
+        assert!(text.contains("/etc/shadow (permission denied)"));
+        assert!(text.contains("--expect-digest"));
+        assert!(text.contains("triagex verify --name web"));
     }
 
     #[test]

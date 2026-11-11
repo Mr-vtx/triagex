@@ -107,6 +107,68 @@ pub fn render(inv: &Investigation) -> String {
         md.push('\n');
     }
 
+    if let Some(r) = &inv.integrity {
+        md.push_str("## File integrity\n\n");
+        md.push_str(&format!(
+            "Baseline `{}` created {} on {}; watching {}. {} paths checked.\n\n",
+            r.name,
+            r.created_at.replace('T', " ").trim_end_matches('Z'),
+            r.hostname,
+            r.roots.join(", "),
+            r.checked
+        ));
+        md.push_str(&format!(
+            "Baseline digest `{}`: {}.\n\n",
+            r.digest,
+            if r.digest_ok {
+                "matches"
+            } else {
+                "DOES NOT MATCH, the baseline may have been edited"
+            }
+        ));
+        let lists: [(&str, &Vec<String>); 4] = [
+            ("Modified", &r.modified),
+            ("Added", &r.added),
+            ("Deleted", &r.deleted),
+            ("Changed type", &r.type_changed),
+        ];
+        for (title, list) in lists {
+            if list.is_empty() {
+                continue;
+            }
+            md.push_str(&format!("**{title} ({})**\n\n", list.len()));
+            for p in list.iter().take(50) {
+                md.push_str(&format!("- `{}`\n", cell(p)));
+            }
+            if list.len() > 50 {
+                md.push_str(&format!("- ... and {} more\n", list.len() - 50));
+            }
+            md.push('\n');
+        }
+        if !r.permissions.is_empty() {
+            md.push_str(&format!(
+                "**Permissions or ownership ({})**\n\n",
+                r.permissions.len()
+            ));
+            for c in r.permissions.iter().take(50) {
+                md.push_str(&format!(
+                    "- `{}`: {:04o} to {:04o}, owner {}:{} to {}:{}\n",
+                    cell(&c.path),
+                    c.old_mode,
+                    c.new_mode,
+                    c.old_owner.0,
+                    c.old_owner.1,
+                    c.new_owner.0,
+                    c.new_owner.1
+                ));
+            }
+            md.push('\n');
+        }
+        if r.changes() == 0 {
+            md.push_str("No changes since the baseline.\n\n");
+        }
+    }
+
     if !inv.skipped.is_empty() {
         md.push_str("## Skipped checks\n\n");
         for s in &inv.skipped {
@@ -142,6 +204,7 @@ mod tests {
             failed_units: Some(vec![]),
             docker: None,
             redis: None,
+            integrity: None,
             findings: vec![Finding {
                 id: "disk.usage:/".into(),
                 severity: Severity::Critical,

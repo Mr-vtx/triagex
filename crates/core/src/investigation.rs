@@ -30,6 +30,8 @@ pub struct Investigation {
     pub docker: Option<DockerInfo>,
     /// None means no Redis was found (or it could not be queried).
     pub redis: Option<RedisInfo>,
+    /// Present when a baseline comparison was requested (`triagex report --verify`).
+    pub integrity: Option<crate::integrity::VerifyReport>,
     pub findings: Vec<Finding>,
     pub log_sources: Vec<String>,
     pub log_lines_scanned: u64,
@@ -77,6 +79,7 @@ pub fn investigate(opts: &LogOptions) -> Investigation {
         failed_units,
         docker,
         redis,
+        integrity: None,
         findings,
         log_sources: logs.sources,
         log_lines_scanned: logs.lines_scanned,
