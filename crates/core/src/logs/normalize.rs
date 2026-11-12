@@ -78,6 +78,14 @@ fn classify_word(w: &str) -> String {
     if w.len() >= 8 && all_hex && any_digit {
         return "<hex>".into();
     }
+    // A number glued to a unit: 250ms, 2840112kB, 512MB. Keep the unit, mask the number.
+    let digits_len = w.bytes().take_while(u8::is_ascii_digit).count();
+    if digits_len > 0 && digits_len < w.len() {
+        let suffix = &w[digits_len..];
+        if suffix.len() <= 4 && suffix.bytes().all(|b| b.is_ascii_alphabetic()) {
+            return format!("<n>{suffix}");
+        }
+    }
     let any_alpha = w.bytes().any(|b| b.is_ascii_alphabetic());
     if w.len() >= 12 && any_digit && any_alpha {
         return "<id>".into();
@@ -169,7 +177,9 @@ fn looks_like_id(value: &str) -> bool {
         .filter(|c| c.is_ascii_uppercase())
         .count();
     let has_lower = value.bytes().any(|b| b.is_ascii_lowercase());
-    has_digit || (value.chars().count() >= 12 && internal_upper >= 3 && has_lower)
+    // 8+ hex characters, even with no digit (deadbeef), is an id when it follows an id key.
+    let all_hex = value.len() >= 8 && value.bytes().all(|b| b.is_ascii_hexdigit());
+    has_digit || all_hex || (value.chars().count() >= 12 && internal_upper >= 3 && has_lower)
 }
 
 const QUOTES: &[char] = &['"', '\''];
@@ -184,7 +194,10 @@ fn mask_value(value: &str) -> Option<String> {
     let (word, rest) = after_quotes.split_at(end);
     let core = word.trim_end_matches('.');
     let dots = &word[core.len()..];
-    looks_like_id(core).then(|| format!("{lead}<id>{dots}{rest}"))
+    // After an id-style key, numbers and hex are ids too: unify them so a request id that
+    // happens to be all digits does not land in a different group from the hex ones.
+    (looks_like_id(core) || core == "<n>" || core == "<hex>")
+        .then(|| format!("{lead}<id>{dots}{rest}"))
 }
 
 /// Collapse request, trace and session ids that the character-level pass cannot recognise
@@ -307,6 +320,24 @@ mod tests {
     }
 
     #[test]
+    fn numbers_glued_to_units_collapse() {
+        assert_eq!(normalize("took 250ms"), normalize("took 90ms"));
+        assert_eq!(normalize("took 250ms"), "took <n>ms");
+        assert_eq!(
+            normalize("Killed process 4121 (node) total-vm:2840112kB"),
+            normalize("Killed process 99 (node) total-vm:512kB")
+        );
+        assert_eq!(
+            normalize("limit 512MB used 3.2GB"),
+            "limit <n>MB used <n>.<n>GB"
+        );
+        // words that merely start with a letter keep their digits
+        assert_eq!(normalize("eth0 ext4 ssh2 sda1"), "eth0 ext4 ssh2 sda1");
+        // a digit-led word that is not a unit stays intact
+        assert_eq!(normalize("code 4f2b9"), "code 4f2b9");
+    }
+
+    #[test]
     fn short_and_letter_only_request_ids_collapse() {
         assert_eq!(
             normalize("error request_id=ab12cd upstream reset"),
@@ -324,6 +355,31 @@ mod tests {
             normalize("error session abc123 expired"),
             "error session <id> expired"
         );
+    }
+
+    #[test]
+    fn numeric_and_hex_ids_after_an_id_key_share_one_pattern() {
+        assert_eq!(
+            normalize("upstream failed request_id=12345678"),
+            normalize("upstream failed request_id=1f2e3d4c")
+        );
+        assert_eq!(
+            normalize("upstream failed request_id=12345678"),
+            "upstream failed request_id=<id>"
+        );
+        // plain numbers elsewhere are still just numbers
+        assert_eq!(normalize("retry 3 of 5"), "retry <n> of <n>");
+    }
+
+    #[test]
+    fn hex_ids_without_digits_collapse_after_an_id_key() {
+        assert_eq!(
+            normalize("failed request_id=deadbeef now"),
+            "failed request_id=<id> now"
+        );
+        // but a plain word that happens to be hex-looking is left alone elsewhere
+        assert_eq!(normalize("the deadbeef value"), "the deadbeef value");
+        assert_eq!(normalize("paid=decaded"), "paid=decaded");
     }
 
     #[test]
@@ -357,7 +413,7 @@ mod tests {
         );
         assert_eq!(
             normalize("trace_id=4bf92f3577b34da6a3ce929d0e0e4736 span failed"),
-            "trace_id=<hex> span failed"
+            "trace_id=<id> span failed"
         );
     }
 

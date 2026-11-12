@@ -1,0 +1,89 @@
+name: Release
+
+# Push a tag like v0.1.0 to build static binaries for x86_64 and aarch64 and publish them.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  target: x86_64-unknown-linux-musl,  runner: ubuntu-latest }
+          - { arch: aarch64, target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The tag must match the version in Cargo.toml (v0.1.0, or v0.1.0-rc1 for a dry run)
+        run: |
+          v="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          case "$GITHUB_REF_NAME" in
+            "v$v" | "v$v"-*) ;;
+            *) echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $v" >&2; exit 1 ;;
+          esac
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p triagex-cli
+
+      - name: The binary must be fully static and must run
+        run: |
+          bin=target/${{ matrix.target }}/release/triagex
+          file "$bin"
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
+          if ldd "$bin" 2>&1 | grep -q '=>'; then echo "shared libraries found" >&2; ldd "$bin" >&2; exit 1; fi
+          "$bin" --version
+
+      - name: Package
+        run: scripts/package.sh "$GITHUB_REF_NAME" ${{ matrix.arch }} target/${{ matrix.target }}/release/triagex dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: triagex-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Combine checksums
+        run: |
+          cd dist
+          cat ./*.sha256 | sort -k2 > SHA256SUMS
+          rm ./*.sha256
+          cat SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          # tags with a dash (v0.1.0-rc1) are published as pre-releases
+          prerelease: ${{ contains(github.ref_name, '-') }}

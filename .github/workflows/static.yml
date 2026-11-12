@@ -1,0 +1,22 @@
+name: Static build
+
+# Every push proves the static musl build compiles, links with no shared libraries,
+# and passes the smoke test against real Docker and Redis.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: ./scripts/build-static.sh x86_64
+      - name: Smoke test with the static binary (real Docker and Redis)
+        run: TRIAGEX=./target/x86_64-unknown-linux-musl/release/triagex ./scripts/smoke.sh
