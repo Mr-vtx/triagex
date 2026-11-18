@@ -26,7 +26,7 @@ jobs:
 
       - name: The tag must match the version in Cargo.toml (v0.1.0, or v0.1.0-rc1 for a dry run)
         run: |
-          v="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          v="$(grep -hm1 '^version' Cargo.toml crates/cli/Cargo.toml | head -n1 | cut -d'"' -f2)"
           case "$GITHUB_REF_NAME" in
             "v$v" | "v$v"-*) ;;
             *) echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $v" >&2; exit 1 ;;
