@@ -1,6 +1,8 @@
 //! Renders an Investigation as a Markdown report.
 
-use crate::{finding::Severity, host::format_uptime, investigation::Investigation};
+use crate::{
+    finding::Severity, host::format_uptime, investigation::Investigation, util::human_bytes,
+};
 
 fn cell(s: &str) -> String {
     s.replace('|', "\\|").replace('\n', " ")
@@ -71,6 +73,75 @@ pub fn render(inv: &Investigation) -> String {
         md.push_str(&format!("- **Evidence:** {}\n", f.evidence));
         md.push_str(&format!("- **Next step:** {}\n", f.next_step));
         md.push_str(&format!("- **Source:** {} (`{}`)\n\n", f.source, f.id));
+    }
+
+    if let Some(n) = &inv.nginx {
+        use crate::collectors::nginx::ConfigState;
+        md.push_str("## Nginx\n\n");
+        let config = match n.config.state {
+            ConfigState::Passed => "passed",
+            ConfigState::Failed => "FAILED",
+            ConfigState::NeedsRoot => "not tested (needs root)",
+            ConfigState::TimedOut => "timed out",
+            ConfigState::NotRun => "not tested (no nginx binary on this host)",
+        };
+        md.push_str(&format!(
+            "- Version: {}\n- Processes: {}\n- Config test (`nginx -t`): {config}\n",
+            n.version.as_deref().unwrap_or("unknown"),
+            n.processes
+        ));
+        for e in &n.config.errors {
+            md.push_str(&format!("  - error: `{}`\n", e.replace('`', "'")));
+        }
+        for w in &n.config.warnings {
+            md.push_str(&format!("  - warning: `{}`\n", w.replace('`', "'")));
+        }
+        match &n.status {
+            Some(s) => md.push_str(&format!(
+                "- Connections: {} active ({} reading, {} writing, {} waiting)\n- Since start: {} requests, {} accepted, {} dropped\n",
+                s.active, s.reading, s.writing, s.waiting, s.requests, s.accepts, s.dropped()
+            )),
+            None => md.push_str("- Status page: not found (stub_status is not enabled or not on a known path)\n"),
+        }
+        md.push('\n');
+    }
+
+    if let Some(p) = &inv.processes {
+        md.push_str("## Processes\n\n");
+        md.push_str(&format!(
+            "{} total, {} running, {} zombie. CPU% is per core over a {} ms sample.{}\n\n",
+            p.total,
+            p.running,
+            p.zombies,
+            p.sample_ms,
+            if p.partial_view {
+                " `/proc` hides other users' processes (hidepid), so this is a partial view."
+            } else {
+                ""
+            }
+        ));
+        for (title, list) in [("Top CPU", &p.top_cpu), ("Top memory", &p.top_mem)] {
+            md.push_str(&format!("**{title}**\n\n"));
+            if list.is_empty() {
+                md.push_str("Nothing above the reporting threshold.\n\n");
+                continue;
+            }
+            md.push_str(
+                "| PID | Name | User | CPU% | Memory | RAM% |\n|---|---|---|---|---|---|\n",
+            );
+            for e in list {
+                md.push_str(&format!(
+                    "| {} | {} | {} | {:.1} | {} | {:.1} |\n",
+                    e.pid,
+                    cell(&e.name),
+                    cell(&e.user),
+                    e.cpu_pct,
+                    human_bytes(e.rss_bytes),
+                    e.mem_pct
+                ));
+            }
+            md.push('\n');
+        }
     }
 
     md.push_str("## Log groups\n\n");
@@ -204,6 +275,8 @@ mod tests {
             failed_units: Some(vec![]),
             docker: None,
             redis: None,
+            nginx: None,
+            processes: None,
             integrity: None,
             findings: vec![Finding {
                 id: "disk.usage:/".into(),
@@ -242,6 +315,74 @@ mod tests {
         assert!(md.contains("- **Evidence:** 95.0% used"));
         assert!(md.contains("## Skipped checks"));
         assert!(md.contains("not root-cause conclusions"));
+    }
+
+    #[test]
+    fn the_nginx_section_shows_config_and_status() {
+        use crate::collectors::nginx::{ConfigState, ConfigTest, NginxInfo, StubStatus};
+        assert!(!render(&sample()).contains("## Nginx"));
+        let mut inv = sample();
+        inv.nginx = Some(NginxInfo {
+            binary: Some("/usr/sbin/nginx".into()),
+            version: Some("1.24.0".into()),
+            processes: 3,
+            config: ConfigTest {
+                state: ConfigState::Failed,
+                syntax_ok: false,
+                errors: vec!["[emerg] unknown `directive`".into()],
+                warnings: vec![],
+            },
+            status: Some(StubStatus {
+                active: 5,
+                accepts: 10,
+                handled: 9,
+                requests: 40,
+                reading: 0,
+                writing: 1,
+                waiting: 4,
+            }),
+            status_url: None,
+        });
+        let md = render(&inv);
+        assert!(md.contains("## Nginx"));
+        assert!(md.contains("Config test (`nginx -t`): FAILED"));
+        assert!(md.contains("error: `[emerg] unknown 'directive'`"));
+        assert!(md.contains("5 active (0 reading, 1 writing, 4 waiting)"));
+        assert!(md.contains("1 dropped"));
+    }
+
+    #[test]
+    fn the_processes_section_appears_only_with_data_and_escapes_names() {
+        use crate::collectors::process::{ProcessEntry, ProcessInfo};
+        let md = render(&sample());
+        assert!(!md.contains("## Processes"));
+
+        let mut inv = sample();
+        inv.processes = Some(ProcessInfo {
+            total: 120,
+            running: 1,
+            zombies: 2,
+            sample_ms: 270,
+            partial_view: true,
+            top_cpu: vec![ProcessEntry {
+                pid: 7,
+                name: "a|b".into(),
+                user: "app".into(),
+                state: 'R',
+                cpu_pct: 142.26,
+                rss_bytes: 3 * 1024 * 1024,
+                mem_pct: 0.5,
+                threads: 2,
+            }],
+            ..ProcessInfo::default()
+        });
+        let md = render(&inv);
+        assert!(md.contains("## Processes"));
+        assert!(md.contains("120 total, 1 running, 2 zombie"));
+        assert!(md.contains("270 ms sample"));
+        assert!(md.contains("partial view"));
+        assert!(md.contains("| 7 | a\\|b | app | 142.3 | 3.0 MiB | 0.5 |"));
+        assert!(md.contains("Nothing above the reporting threshold."));
     }
 
     #[test]

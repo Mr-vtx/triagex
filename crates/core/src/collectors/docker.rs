@@ -29,6 +29,8 @@ pub struct ContainerInfo {
     pub restart_count: u64,
     pub exit_code: Option<i64>,
     pub oom_killed: bool,
+    /// Memory limit in bytes; 0 means no limit
+    pub memory_limit: u64,
 }
 
 impl ContainerInfo {
@@ -87,6 +89,14 @@ struct Inspect {
     restart_count: u64,
     #[serde(rename = "State", default)]
     state: InspectState,
+    #[serde(rename = "HostConfig", default)]
+    host_config: HostConfig,
+}
+
+#[derive(Deserialize, Default)]
+struct HostConfig {
+    #[serde(rename = "Memory", default)]
+    memory: u64,
 }
 
 #[derive(Deserialize, Default)]
@@ -230,6 +240,7 @@ pub fn collect_from(socket: &Path) -> Result<DockerInfo, String> {
             restart_count: 0,
             exit_code: None,
             oom_killed: false,
+            memory_limit: 0,
         };
 
         // Ids come from the daemon; only hex is ever put into a request path.
@@ -242,6 +253,7 @@ pub fn collect_from(socket: &Path) -> Result<DockerInfo, String> {
             c.restart_count = ins.restart_count;
             c.exit_code = Some(ins.state.exit_code);
             c.oom_killed = ins.state.oom_killed;
+            c.memory_limit = ins.host_config.memory;
             if let Some(h) = ins.state.health
                 && !h.status.is_empty()
             {
@@ -351,6 +363,7 @@ mod tests {
             restart_count: 0,
             exit_code: None,
             oom_killed: false,
+            memory_limit: 0,
         };
         assert!(!base.is_problem());
         let mut c = base.clone();
@@ -445,6 +458,19 @@ mod tests {
         assert!(worker.is_problem());
         assert_eq!(info.running(), 1);
         assert_eq!(info.problems(), 1);
+    }
+
+    #[test]
+    fn the_memory_limit_comes_from_host_config() {
+        let ins: Inspect = serde_json::from_str(
+            r#"{"RestartCount":0,"State":{"ExitCode":137,"OOMKilled":false},"HostConfig":{"Memory":20971520}}"#,
+        )
+        .unwrap();
+        assert_eq!(ins.host_config.memory, 20971520);
+        assert!(!ins.state.oom_killed);
+        // an inspect reply without HostConfig means no limit
+        let bare: Inspect = serde_json::from_str(r#"{"RestartCount":1,"State":{}}"#).unwrap();
+        assert_eq!(bare.host_config.memory, 0);
     }
 
     #[test]

@@ -7,6 +7,8 @@ use triagex_core::{
     Meter,
     collectors::{
         docker::{ContainerInfo, DockerInfo},
+        nginx::{ConfigState, NginxInfo},
+        process::{ProcessEntry, ProcessInfo},
         redis::RedisInfo,
     },
     finding::{Finding, Severity},
@@ -110,6 +112,7 @@ fn status_row(ui: &Ui, label: &str, state: &str) -> String {
     format!("{} {state}", ui.paint(&format!("{label:<10}"), Style::Bold))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn system_panel(
     ui: &Ui,
     host: &HostInfo,
@@ -118,6 +121,8 @@ fn system_panel(
     docker: &Option<DockerInfo>,
     redis: &Option<RedisInfo>,
     redis_bad: bool,
+    nginx: &Option<NginxInfo>,
+    nginx_bad: bool,
 ) -> String {
     let inner = ui.inner();
     let mut body = vec![
@@ -185,6 +190,30 @@ fn system_panel(
         None => ui.paint("not detected", Style::Dim),
     };
     body.push(status_row(ui, "REDIS", &redis_state));
+
+    let nginx_state = match nginx {
+        Some(n) => {
+            let mark = if nginx_bad {
+                ui.cross_mark()
+            } else {
+                ui.check_mark()
+            };
+            let sep = ui.sep();
+            let mut text = format!("{mark} {}", n.version.as_deref().unwrap_or("nginx"));
+            if n.running() {
+                text.push_str(&format!(" {sep} {} processes", n.processes));
+            } else {
+                text.push_str(&format!(" {sep} not running"));
+            }
+            text.push_str(&format!(" {sep} {}", config_word(n.config.state)));
+            if let Some(s) = &n.status {
+                text.push_str(&format!(" {sep} {} active", s.active));
+            }
+            text
+        }
+        None => ui.paint("not detected", Style::Dim),
+    };
+    body.push(status_row(ui, "NGINX", &nginx_state));
 
     ui.panel("system", &host.hostname, &body)
 }
@@ -254,6 +283,11 @@ fn findings_panel(ui: &Ui, findings: &[Finding], max: Option<usize>) -> String {
 fn container_note(ui: &Ui, c: &ContainerInfo) -> String {
     if c.oom_killed {
         ui.paint("OOM killed", Style::Crit)
+    } else if (c.state == "exited" || c.state == "dead")
+        && c.exit_code == Some(137)
+        && c.memory_limit > 0
+    {
+        ui.paint("probably OOM", Style::Warn)
     } else if c.state == "restarting" {
         ui.paint(&format!("restarting, {}x", c.restart_count), Style::Warn)
     } else if (c.state == "exited" || c.state == "dead") && c.exit_code.unwrap_or(0) != 0 {
@@ -429,6 +463,144 @@ fn summary_line(ui: &Ui, findings: &[Finding]) -> String {
     )
 }
 
+/// One row of the process table. Numbers are right-aligned and padded BEFORE coloring,
+/// because color codes would otherwise break the alignment.
+fn process_row(ui: &Ui, e: &ProcessEntry, cores: usize, w: &ProcCols) -> String {
+    let cpu_text = format!("{:>w$.1}", e.cpu_pct, w = w.cpu);
+    let cpu_hot = e.cpu_pct / cores.max(1) as f64 >= 80.0;
+    let mem_hot = e.mem_pct >= 50.0;
+
+    let mut row = pad_to(&fit(&e.name, w.name, "~"), w.name);
+    row.push_str(&format!("  {:>w$}", e.pid, w = w.pid));
+    if w.user > 0 {
+        row.push_str(&format!("  {}", pad_to(&fit(&e.user, w.user, "~"), w.user)));
+    }
+    row.push_str(&format!(
+        "  {}",
+        ui.paint(&cpu_text, if cpu_hot { Style::Warn } else { Style::Bold })
+    ));
+    let mem_text = format!("{:>w$}", human_bytes(e.rss_bytes), w = w.mem);
+    row.push_str(&format!(
+        "  {}",
+        ui.paint(&mem_text, if mem_hot { Style::Warn } else { Style::Bold })
+    ));
+    if w.ram > 0 {
+        row.push_str(&format!("  {:>w$.1}", e.mem_pct, w = w.ram));
+    }
+    row
+}
+
+/// Column widths for the process table, chosen from the space the panel has.
+struct ProcCols {
+    name: usize,
+    pid: usize,
+    user: usize,
+    cpu: usize,
+    mem: usize,
+    ram: usize,
+}
+
+impl ProcCols {
+    fn for_width(inner: usize) -> Self {
+        let (pid, cpu, mem) = (7usize, 6usize, 9usize);
+        // Full table: name, pid, user, cpu, mem, ram%. Gaps are two spaces.
+        let (user, ram) = if inner >= 66 {
+            (10usize, 5usize)
+        } else {
+            (0, 0)
+        };
+        let columns = 4 + usize::from(user > 0) + usize::from(ram > 0);
+        let fixed = pid + cpu + mem + user + ram + (columns - 1) * 2;
+        ProcCols {
+            name: inner.saturating_sub(fixed).clamp(8, 24),
+            pid,
+            user,
+            cpu,
+            mem,
+            ram,
+        }
+    }
+
+    fn header(&self, ui: &Ui, title: &str) -> String {
+        let mut h = pad_to(title, self.name);
+        h.push_str(&format!("  {:>w$}", "PID", w = self.pid));
+        if self.user > 0 {
+            h.push_str(&format!("  {}", pad_to("USER", self.user)));
+        }
+        h.push_str(&format!("  {:>w$}", "CPU%", w = self.cpu));
+        h.push_str(&format!("  {:>w$}", "MEM", w = self.mem));
+        if self.ram > 0 {
+            h.push_str(&format!("  {:>w$}", "RAM%", w = self.ram));
+        }
+        ui.paint(&h, Style::Dim)
+    }
+}
+
+fn process_panel(ui: &Ui, p: &ProcessInfo, cores: usize, max_rows: Option<usize>) -> String {
+    let cols = ProcCols::for_width(ui.inner());
+    let rows = max_rows.unwrap_or(p.top_cpu.len().max(p.top_mem.len()));
+    let mut body = Vec::new();
+
+    body.push(cols.header(ui, "TOP CPU"));
+    if p.top_cpu.is_empty() {
+        dim_lines(
+            ui,
+            "no process used more than 0.05% CPU during the sample",
+            &mut body,
+        );
+    }
+    for e in p.top_cpu.iter().take(rows) {
+        body.push(process_row(ui, e, cores, &cols));
+    }
+
+    body.push(String::new());
+    body.push(cols.header(ui, "TOP MEMORY"));
+    for e in p.top_mem.iter().take(rows) {
+        body.push(process_row(ui, e, cores, &cols));
+    }
+
+    body.push(String::new());
+    dim_lines(
+        ui,
+        "CPU% is per core (200 = two cores busy), sampled over a short window.",
+        &mut body,
+    );
+    if p.partial_view {
+        dim_lines(
+            ui,
+            "/proc hides other users' processes here (hidepid). Run with sudo for all of them.",
+            &mut body,
+        );
+    }
+
+    let sep = ui.sep();
+    let right = format!(
+        "{} total {sep} {} running {sep} {} zombie",
+        p.total, p.running, p.zombies
+    );
+    ui.panel("processes", &right, &body)
+}
+
+/// Wraps a plain sentence to the panel width, then colors each line. Wrapping must happen
+/// before painting, or color codes would be split across lines.
+fn dim_lines(ui: &Ui, text: &str, body: &mut Vec<String>) {
+    for l in wrap(text, ui.inner()) {
+        body.push(ui.paint(&l, Style::Dim));
+    }
+}
+
+fn process_panel_if_any(
+    ui: &Ui,
+    processes: &Option<ProcessInfo>,
+    cores: usize,
+    max_rows: Option<usize>,
+) -> String {
+    match processes {
+        Some(p) if p.total > 0 => process_panel(ui, p, cores, max_rows),
+        _ => String::new(),
+    }
+}
+
 fn docker_panel_if_any(ui: &Ui, docker: &Option<DockerInfo>, max_rows: Option<usize>) -> String {
     match docker {
         Some(d) if !d.containers.is_empty() => docker_panel(ui, d, max_rows),
@@ -458,8 +630,19 @@ pub fn overview(
         &inv.docker,
         &inv.redis,
         has_redis_finding(&inv.findings),
+        &inv.nginx,
+        has_nginx_finding(&inv.findings),
     ));
     out.push_str(&findings_panel(ui, &inv.findings, max_findings));
+    if max_findings.is_none() {
+        out.push_str(&nginx_panel_if_any(ui, &inv.nginx));
+    }
+    out.push_str(&process_panel_if_any(
+        ui,
+        &inv.processes,
+        inv.host.cpu_cores,
+        max_findings.map(|_| 3),
+    ));
     out.push_str(&docker_panel_if_any(
         ui,
         &inv.docker,
@@ -683,6 +866,118 @@ pub fn baseline_screen(ui: &Ui, b: &BaselineSummary) -> String {
     out
 }
 
+fn config_word(state: ConfigState) -> &'static str {
+    match state {
+        ConfigState::Passed => "config ok",
+        ConfigState::Failed => "config FAILED",
+        ConfigState::NeedsRoot => "config untested (needs root)",
+        ConfigState::TimedOut => "config test timed out",
+        ConfigState::NotRun => "config untested",
+    }
+}
+
+fn has_nginx_finding(findings: &[Finding]) -> bool {
+    findings
+        .iter()
+        .any(|f| f.id == "nginx.config" || f.id == "nginx.dropped")
+}
+
+/// Details for the full views: the config test result and the live counters.
+fn nginx_panel(ui: &Ui, n: &NginxInfo) -> String {
+    let mut body = Vec::new();
+    let sep = ui.sep();
+
+    let config = match n.config.state {
+        ConfigState::Passed => format!("{} passed", ui.check_mark()),
+        ConfigState::Failed => format!(
+            "{} {}",
+            ui.cross_mark(),
+            if n.config.syntax_ok {
+                "syntax ok, but the test failed"
+            } else {
+                "has an error"
+            }
+        ),
+        ConfigState::NeedsRoot => "not tested: needs root (try sudo)".to_string(),
+        ConfigState::TimedOut => "not finished: nginx -t timed out".to_string(),
+        ConfigState::NotRun => {
+            "not tested: no nginx binary here, so it probably runs in a container (docker exec <name> nginx -t)"
+                .to_string()
+        }
+    };
+    let mut first = true;
+    for l in wrap(&config, ui.inner().saturating_sub(10).max(20)) {
+        let label = if first { "CONFIG" } else { "" };
+        body.push(format!(
+            "{} {l}",
+            ui.paint(&format!("{label:<8}"), Style::Bold)
+        ));
+        first = false;
+    }
+    for e in n.config.errors.iter().take(3) {
+        for l in wrap(e, ui.inner().saturating_sub(10).max(20)) {
+            body.push(format!("{:<8} {}", "", ui.paint(&l, Style::Warn)));
+        }
+    }
+    if let Some(w) = n.config.warnings.first() {
+        for l in wrap(
+            &format!("warning: {w}"),
+            ui.inner().saturating_sub(10).max(20),
+        ) {
+            body.push(format!("{:<8} {}", "", ui.paint(&l, Style::Dim)));
+        }
+    }
+
+    match &n.status {
+        Some(s) => {
+            body.push(format!(
+                "{} {} active {sep} {} reading {sep} {} writing {sep} {} waiting",
+                ui.paint(&format!("{:<8}", "STATUS"), Style::Bold),
+                s.active,
+                s.reading,
+                s.writing,
+                s.waiting
+            ));
+            body.push(format!(
+                "{:<8} {} requests {sep} {} accepted {sep} {} dropped",
+                "",
+                s.requests,
+                s.accepts,
+                s.dropped()
+            ));
+        }
+        None if n.running() => {
+            let hint = "stub_status not found. To see live connections add: location = /nginx_status { stub_status; allow 127.0.0.1; deny all; }";
+            for (i, l) in wrap(hint, ui.inner().saturating_sub(10).max(20))
+                .iter()
+                .enumerate()
+            {
+                let label = if i == 0 { "STATUS" } else { "" };
+                body.push(format!(
+                    "{} {}",
+                    ui.paint(&format!("{label:<8}"), Style::Bold),
+                    ui.paint(l, Style::Dim)
+                ));
+            }
+        }
+        None => {}
+    }
+
+    let right = format!(
+        "{} {sep} {} process(es)",
+        n.version.as_deref().unwrap_or("unknown version"),
+        n.processes
+    );
+    ui.panel("nginx", &right, &body)
+}
+
+fn nginx_panel_if_any(ui: &Ui, nginx: &Option<NginxInfo>) -> String {
+    nginx
+        .as_ref()
+        .map(|n| nginx_panel(ui, n))
+        .unwrap_or_default()
+}
+
 fn has_redis_finding(findings: &[Finding]) -> bool {
     findings.iter().any(|f| f.id.starts_with("redis."))
 }
@@ -695,6 +990,8 @@ pub fn check(
     failed: &Option<Vec<String>>,
     docker: &Option<DockerInfo>,
     redis: &Option<RedisInfo>,
+    nginx: &Option<NginxInfo>,
+    processes: &Option<ProcessInfo>,
     findings: &[Finding],
     skipped: &[String],
 ) -> String {
@@ -708,8 +1005,12 @@ pub fn check(
         docker,
         redis,
         has_redis_finding(findings),
+        nginx,
+        has_nginx_finding(findings),
     ));
     out.push_str(&findings_panel(ui, findings, None));
+    out.push_str(&nginx_panel_if_any(ui, nginx));
+    out.push_str(&process_panel_if_any(ui, processes, host.cpu_cores, None));
     out.push_str(&docker_panel_if_any(ui, docker, None));
     out.push_str(&skipped_panel(ui, skipped));
     line!(out, "{}", summary_line(ui, findings));
@@ -824,6 +1125,41 @@ mod tests {
             restart_count: 0,
             exit_code: None,
             oom_killed: false,
+            memory_limit: 0,
+        }
+    }
+
+    fn proc_entry(pid: u32, name: &str, cpu: f64, rss: u64, mem: f64) -> ProcessEntry {
+        ProcessEntry {
+            pid,
+            name: name.into(),
+            user: "deploy".into(),
+            state: 'S',
+            cpu_pct: cpu,
+            rss_bytes: rss,
+            mem_pct: mem,
+            threads: 8,
+        }
+    }
+
+    fn sample_processes() -> ProcessInfo {
+        ProcessInfo {
+            total: 214,
+            running: 2,
+            sleeping: 200,
+            zombies: 1,
+            stuck: vec![],
+            sample_ms: 262,
+            partial_view: false,
+            top_cpu: vec![
+                proc_entry(4021, "node", 187.4, 1_288_490_188, 31.2),
+                proc_entry(988, "postgres", 12.0, 536_870_912, 13.0),
+                proc_entry(1, "systemd", 0.3, 12_582_912, 0.3),
+            ],
+            top_mem: vec![
+                proc_entry(4021, "node", 187.4, 1_288_490_188, 31.2),
+                proc_entry(988, "postgres", 12.0, 536_870_912, 13.0),
+            ],
         }
     }
 
@@ -863,6 +1199,8 @@ mod tests {
             ],
             failed_units: Some(vec!["nginx.service".into()]),
             integrity: None,
+            nginx: None,
+            processes: Some(sample_processes()),
             redis: Some(RedisInfo {
                 addr: "127.0.0.1:6379".into(),
                 version: "7.2.4".into(),
@@ -949,6 +1287,7 @@ mod tests {
         for needle in [
             "system",
             "findings",
+            "processes",
             "docker",
             "logs",
             "skipped",
@@ -964,6 +1303,160 @@ mod tests {
         ] {
             assert!(text.contains(needle), "missing {needle}");
         }
+    }
+
+    fn sample_nginx(state: ConfigState, errors: &[&str], status: bool) -> NginxInfo {
+        use triagex_core::collectors::nginx::{ConfigTest, StubStatus};
+        NginxInfo {
+            binary: Some("/usr/sbin/nginx".into()),
+            version: Some("1.24.0".into()),
+            processes: 3,
+            config: ConfigTest {
+                state,
+                syntax_ok: false,
+                errors: errors.iter().map(|e| e.to_string()).collect(),
+                warnings: vec![],
+            },
+            status: status.then(|| StubStatus {
+                active: 12,
+                accepts: 500,
+                handled: 498,
+                requests: 4521,
+                reading: 0,
+                writing: 2,
+                waiting: 10,
+            }),
+            status_url: None,
+        }
+    }
+
+    #[test]
+    fn nginx_shows_a_status_row_always_and_a_panel_only_in_full_views() {
+        let mut inv = sample();
+        assert!(overview(&ui(false, 80), &inv, None, false, false).contains("NGINX"));
+        assert!(overview(&ui(false, 80), &inv, None, false, false).contains("not detected"));
+
+        inv.nginx = Some(sample_nginx(ConfigState::Passed, &[], true));
+        let short = overview(&ui(false, 80), &inv, Some(5), false, false);
+        assert!(
+            short.contains("1.24.0") && short.contains("config ok") && short.contains("12 active")
+        );
+        assert!(!short.contains("─ nginx"));
+
+        let full = overview(&ui(false, 80), &inv, None, false, false);
+        assert!(full.contains("─ nginx"));
+        assert!(full.contains("4521 requests"));
+        assert!(full.contains("2 dropped"));
+        assert!(full.lines().all(|l| crate::ui::visible_width(l) <= 80));
+    }
+
+    #[test]
+    fn a_failed_config_test_shows_the_error_and_marks_the_row() {
+        let mut inv = sample();
+        inv.nginx = Some(sample_nginx(
+            ConfigState::Failed,
+            &["[emerg] unknown directive \"servr\" in /etc/nginx/sites-enabled/app:3"],
+            false,
+        ));
+        let text = overview(&ui(false, 80), &inv, None, false, false);
+        assert!(text.contains("config FAILED"));
+        assert!(text.contains("has an error"));
+        assert!(text.contains("unknown directive"));
+        assert!(text.contains("stub_status not found"));
+        assert!(text.lines().all(|l| crate::ui::visible_width(l) <= 80));
+    }
+
+    #[test]
+    fn nginx_without_root_or_without_a_binary_explains_itself() {
+        let mut inv = sample();
+        inv.nginx = Some(sample_nginx(ConfigState::NeedsRoot, &[], false));
+        assert!(overview(&ui(false, 80), &inv, None, false, false).contains("needs root"));
+        let mut n = sample_nginx(ConfigState::NotRun, &[], false);
+        n.binary = None;
+        n.version = None;
+        inv.nginx = Some(n);
+        let text = overview(&ui(false, 80), &inv, None, false, false);
+        assert!(text.contains("container"));
+        assert!(text.lines().all(|l| crate::ui::visible_width(l) <= 80));
+    }
+
+    #[test]
+    fn process_panel_lists_both_rankings_with_aligned_columns() {
+        let text = overview(&ui(false, 80), &sample(), None, false, false);
+        assert!(text.contains("─ processes"));
+        assert!(text.contains("214 total"));
+        assert!(text.contains("TOP CPU"));
+        assert!(text.contains("TOP MEMORY"));
+        let node: Vec<&str> = text.lines().filter(|l| l.contains(" node ")).collect();
+        assert_eq!(node.len(), 2, "node appears once per ranking");
+        // the cpu column lines up between the header and the row
+        let header = text.lines().find(|l| l.contains("TOP CPU")).unwrap();
+        let cpu_end = header.find("CPU%").unwrap() + 4;
+        assert!(node[0].contains("187.4"));
+        assert_eq!(node[0].find("187.4").unwrap() + 5, cpu_end);
+    }
+
+    #[test]
+    fn the_overview_shows_three_rows_per_ranking_and_the_report_shows_all() {
+        let mut inv = sample();
+        inv.processes = Some(ProcessInfo {
+            top_cpu: (1..=5)
+                .map(|i| proc_entry(i, &format!("cpu{i}"), 50.0, 1, 1.0))
+                .collect(),
+            top_mem: (1..=5)
+                .map(|i| proc_entry(i, &format!("mem{i}"), 0.1, 1_000_000 * i as u64, 1.0))
+                .collect(),
+            ..sample_processes()
+        });
+        let short = overview(&ui(false, 80), &inv, Some(5), false, false);
+        assert!(short.contains("cpu3") && !short.contains("cpu4"));
+        let full = overview(&ui(false, 80), &inv, None, false, false);
+        assert!(full.contains("cpu5") && full.contains("mem5"));
+    }
+
+    #[test]
+    fn narrow_terminals_drop_columns_instead_of_breaking_the_layout() {
+        let narrow = overview(&ui(false, 50), &sample(), None, false, false);
+        assert!(narrow.contains("TOP CPU"));
+        assert!(!narrow.contains("USER"));
+        let wide = overview(&ui(false, 100), &sample(), None, false, false);
+        assert!(wide.contains("USER") && wide.contains("RAM%") && wide.contains("deploy"));
+    }
+
+    #[test]
+    fn busy_processes_are_highlighted_only_when_they_hog_the_machine() {
+        let hot = overview(&ui(true, 80), &sample(), None, false, false);
+        // node: 187% of 4 cores is under 80% of the machine, so no warning color on it
+        let warn = "\x1b[";
+        assert!(hot.contains(warn));
+        let mut inv = sample();
+        inv.host.cpu_cores = 2;
+        let hotter = overview(&ui(true, 80), &inv, None, false, false);
+        assert_ne!(
+            hot, hotter,
+            "187% on 2 cores is a hog and is colored differently"
+        );
+    }
+
+    #[test]
+    fn an_idle_machine_and_a_hidden_proc_both_explain_themselves() {
+        let mut inv = sample();
+        inv.processes = Some(ProcessInfo {
+            top_cpu: vec![],
+            partial_view: true,
+            ..sample_processes()
+        });
+        let text = overview(&ui(false, 80), &inv, None, false, false);
+        assert!(text.contains("no process used more than 0.05% CPU"));
+        assert!(text.contains("hidepid"));
+        assert!(text.lines().all(|l| crate::ui::visible_width(l) <= 80));
+    }
+
+    #[test]
+    fn the_process_panel_is_absent_when_proc_was_unreadable() {
+        let mut inv = sample();
+        inv.processes = None;
+        assert!(!overview(&ui(false, 80), &inv, None, false, false).contains("─ processes"));
     }
 
     #[test]

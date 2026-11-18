@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use triagex_core::{
     Snapshot,
+    anonymize::Scrubber,
     finding::{Finding, Severity},
     integrity::{self, DEFAULT_MAX_FILES, DEFAULT_MAX_HASH_MB, ScanOptions},
     investigation::{Investigation, investigate},
@@ -51,6 +52,10 @@ struct Cli {
     /// Tighter layout: no padding inside panels, no gaps between them
     #[arg(long, global = true)]
     compact: bool,
+
+    /// Hide IP addresses, the hostname and your user name (for screenshots and bug reports)
+    #[arg(long, global = true)]
+    anonymize: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -151,6 +156,20 @@ enum Commands {
     About,
 }
 
+static SCRUB: std::sync::OnceLock<Scrubber> = std::sync::OnceLock::new();
+
+/// Everything printed or written goes through here, so --anonymize covers all of it.
+fn scrubbed(text: &str) -> String {
+    match SCRUB.get() {
+        Some(scrubber) => scrubber.apply_aligned(text),
+        None => text.to_string(),
+    }
+}
+
+fn emit(text: &str) {
+    print!("{}", scrubbed(text));
+}
+
 fn main() -> ExitCode {
     // Behave like a normal Unix tool when piped (`triagex logs | head`): exit quietly on a
     // closed pipe instead of panicking. Rust ignores SIGPIPE by default.
@@ -160,6 +179,9 @@ fn main() -> ExitCode {
     }
 
     let cli = Cli::parse();
+    if cli.anonymize {
+        SCRUB.set(Scrubber::from_env()).ok();
+    }
     let ui = Ui::detect(cli.color, ui::resolve_theme(cli.theme), cli.compact);
     // The big logo only appears when colors are on (a real terminal), never in pipes or logs.
     let banner = ui.color && !cli.no_banner;
@@ -207,7 +229,7 @@ fn main() -> ExitCode {
             json,
         }) => logs(&ui, files, journal, &since, top, all, json),
         Some(Commands::About) => {
-            print!("{}", render::about_screen(&ui));
+            emit(&render::about_screen(&ui));
             ExitCode::SUCCESS
         }
     }
@@ -224,7 +246,7 @@ fn exit_for(worst: Option<Severity>) -> ExitCode {
 fn print_json<T: serde::Serialize>(value: &T) -> Result<(), ExitCode> {
     match serde_json::to_string_pretty(value) {
         Ok(s) => {
-            println!("{s}");
+            println!("{}", scrubbed(&s));
             Ok(())
         }
         Err(e) => {
@@ -269,7 +291,7 @@ fn overview(ui: &Ui, since: &str, json: bool, banner: bool) -> ExitCode {
             return code;
         }
     } else {
-        print!("{}", render::overview(ui, &inv, Some(5), banner, true));
+        emit(&render::overview(ui, &inv, Some(5), banner, true));
     }
     exit_for(inv.worst())
 }
@@ -306,7 +328,7 @@ fn report(
 
     let rendered = match format {
         Format::Text => {
-            print!("{}", render::overview(ui, &inv, None, false, false));
+            emit(&render::overview(ui, &inv, None, false, false));
             return exit_for(inv.worst());
         }
         Format::Json => match serde_json::to_string_pretty(&inv) {
@@ -321,13 +343,13 @@ fn report(
 
     match output {
         Some(path) => {
-            if let Err(e) = std::fs::write(&path, rendered) {
+            if let Err(e) = std::fs::write(&path, scrubbed(&rendered)) {
                 eprintln!("triagex: could not write {}: {e}", path.display());
                 return ExitCode::from(3);
             }
             println!("Wrote report to {}", path.display());
         }
-        None => println!("{rendered}"),
+        None => println!("{}", scrubbed(&rendered)),
     }
     exit_for(inv.worst())
 }
@@ -402,7 +424,7 @@ fn baseline(
             return code;
         }
     } else {
-        print!("{}", render::baseline_screen(ui, &summary));
+        emit(&render::baseline_screen(ui, &summary));
     }
     ExitCode::SUCCESS
 }
@@ -423,7 +445,7 @@ fn verify_cmd(ui: &Ui, name: &str, expect_digest: Option<&str>, json: bool) -> E
             return code;
         }
     } else {
-        print!("{}", render::verify_screen(ui, &report));
+        emit(&render::verify_screen(ui, &report));
     }
     exit_for(worst(&report.findings))
 }
@@ -437,19 +459,18 @@ fn system_check(ui: &Ui, json: bool) -> ExitCode {
             return code;
         }
     } else {
-        print!(
-            "{}",
-            render::check(
-                ui,
-                &triagex_core::host::collect(),
-                &snap.meters(),
-                &snap.failed_units,
-                &snap.docker,
-                &snap.redis,
-                &findings,
-                &snap.skipped
-            )
-        );
+        emit(&render::check(
+            ui,
+            &triagex_core::host::collect(),
+            &snap.meters(),
+            &snap.failed_units,
+            &snap.docker,
+            &snap.redis,
+            &snap.nginx,
+            &snap.processes,
+            &findings,
+            &snap.skipped,
+        ));
     }
     exit_for(worst(&findings))
 }
@@ -483,7 +504,7 @@ fn logs(
             return code;
         }
     } else {
-        print!("{}", render::logs(ui, &report));
+        emit(&render::logs(ui, &report));
     }
     exit_for(report.worst())
 }

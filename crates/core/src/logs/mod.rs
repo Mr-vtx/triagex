@@ -2,6 +2,7 @@
 //! and show when each group happened.
 
 pub mod group;
+pub mod nginx;
 pub mod normalize;
 pub mod parse;
 pub mod redact;
@@ -19,7 +20,7 @@ use group::{Grouper, LogGroup, timeline};
 use parse::{ParseContext, parse_line};
 
 pub const TIMELINE_BUCKETS: usize = 24;
-const DEFAULT_FILES: &[&str] = &["/var/log/auth.log"];
+const DEFAULT_FILES: &[&str] = &["/var/log/auth.log", "/var/log/nginx/error.log"];
 
 #[derive(Debug, Clone)]
 pub struct LogOptions {
@@ -164,7 +165,7 @@ fn short_hash(s: &str) -> String {
     format!("{:08x}", h as u32)
 }
 
-fn range_text(g: &LogGroup) -> String {
+pub(crate) fn range_text(g: &LogGroup) -> String {
     match (g.first_seen, g.last_seen) {
         (Some(a), Some(b)) => format!("between {} and {} UTC", format_utc(a), format_utc(b)),
         _ => "at unknown times".to_string(),
@@ -203,8 +204,10 @@ pub fn findings_from_groups(groups: &[LogGroup]) -> Vec<Finding> {
         });
     }
 
+    out.extend(nginx::findings(groups));
+
     for g in groups {
-        if g.pattern.starts_with("Failed password") || g.count < 100 {
+        if g.pattern.starts_with("Failed password") || g.count < 100 || nginx::is_covered(g) {
             continue;
         }
         out.push(Finding {

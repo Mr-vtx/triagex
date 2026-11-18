@@ -52,6 +52,30 @@ expect_no_id() {
   if has_id "$1" "$2"; then bad "$3  (unexpected finding matching $2)"; else ok "$3"; fi
 }
 
+# When a Docker or Redis check fails, show what Triagex saw and what Docker/Redis say,
+# so a failure in CI is explained by its own log.
+show_context() {
+  echo "  ---- context for the failures above ----"
+  python3 - "$WORK/dock.json" <<'PYEOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+for c in (d.get("docker") or {}).get("containers", []):
+    if c["name"].startswith("tx-"):
+        print(f"  triagex saw {c['name']:<14} state={c['state']:<10} exit={c['exit_code']} oom_flag={c['oom_killed']} "
+              f"mem_limit={c.get('memory_limit')} restarts={c['restart_count']} health={c['health']}")
+r = d.get("redis")
+if r:
+    pct = (100.0 * r["used_memory"] / r["max_memory"]) if r["max_memory"] else 0
+    print(f"  triagex saw redis: used={r['used_memory']} max={r['max_memory']} ({pct:.1f}%) evicted={r['evicted_keys']}")
+ids = sorted(f["id"] for f in d.get("findings", []) if f["id"].startswith(("docker.", "redis.")))
+print("  triagex findings:", ", ".join(ids) if ids else "(none)")
+PYEOF
+  if [ "${ASSERT_ONLY:-0}" != 1 ]; then
+    $RUN $DOCKER inspect -f '  docker says tx-oom: oom_flag={{.State.OOMKilled}} exit={{.State.ExitCode}} mem_limit={{.HostConfig.Memory}}' tx-oom 2>/dev/null
+    $RUN $DOCKER exec tx-redis redis-cli info memory 2>/dev/null | tr -d '\r' | grep -E '^(used_memory|maxmemory):' | sed 's/^/  redis says: /'
+  fi
+}
+
 cleanup() {
   if [ "${DOCKER_READY:-0}" = 1 ]; then
     $RUN $DOCKER rm -f tx-ok tx-crash tx-loop tx-oom tx-sick tx-redis tx-redis-auth >/dev/null 2>&1
@@ -78,6 +102,16 @@ fi
 "$TRIAGEX" --json >"$WORK/overview.json" 2>/dev/null
 if [ "$(json_get "$WORK/overview.json" "len(d['meters']) >= 3")" = True ]; then ok "overview has load, memory and disk gauges"; else bad "overview is missing gauges"; fi
 if [ "$(json_get "$WORK/overview.json" "bool(d['host']['hostname'])")" = True ]; then ok "host info is filled in"; else bad "host info missing"; fi
+
+# A real CPU burner: the process view must find it by pid and see it using most of a core.
+python3 -c 'while True: pass' &
+BURN_PID=$!
+sleep 1
+"$TRIAGEX" --json >"$WORK/proc.json" 2>/dev/null
+kill "$BURN_PID" 2>/dev/null; wait "$BURN_PID" 2>/dev/null
+if [ "$(json_get "$WORK/proc.json" "d['processes']['total'] > 0")" = True ]; then ok "process view reads /proc"; else bad "process view is empty"; fi
+if [ "$(json_get "$WORK/proc.json" "any(e['pid'] == $BURN_PID and e['cpu_pct'] > 50 for e in d['processes']['top_cpu'])")" = True ]; then ok "a real CPU burner shows up in the top CPU list"; else bad "the CPU burner (pid $BURN_PID) was not found in top_cpu"; fi
+if [ "$(json_get "$WORK/proc.json" "all(not any(ord(c) < 32 for c in e['name']) for e in d['processes']['top_mem'])")" = True ]; then ok "process names carry no control characters"; else bad "a process name has control characters"; fi
 
 # ---------------------------------------------------------------- 2. logs
 section "log triage (sample file)"
@@ -137,7 +171,7 @@ else
     $RUN $DOCKER run -d --name tx-ok nginx:alpine >/dev/null
     $RUN $DOCKER run -d --name tx-crash alpine:3.20 sh -c 'exit 3' >/dev/null
     $RUN $DOCKER run -d --name tx-loop --restart always alpine:3.20 sh -c 'exit 1' >/dev/null
-    $RUN $DOCKER run -d --name tx-oom -m 20m --memory-swap 20m alpine:3.20 sh -c 'tail /dev/zero' >/dev/null
+    $RUN $DOCKER run -d --name tx-oom -m 20m --memory-swap 20m alpine:3.20 tail /dev/zero >/dev/null
     $RUN $DOCKER run -d --name tx-sick --health-cmd 'exit 1' --health-interval 2s --health-retries 2 nginx:alpine >/dev/null
     $RUN $DOCKER run -d --name tx-redis -p 127.0.0.1:16379:6379 redis:7 redis-server --maxmemory 5mb --maxmemory-policy allkeys-lru >/dev/null
     $RUN $DOCKER run -d --name tx-redis-auth -p 127.0.0.1:16380:6379 redis:7 redis-server --requirepass secret >/dev/null
@@ -146,26 +180,34 @@ else
       $RUN $DOCKER exec tx-redis redis-cli ping 2>/dev/null | grep -q PONG && break; sleep 1
     done
     $RUN $DOCKER exec tx-redis redis-benchmark -q -n 200000 -t set -d 200 -r 1000000 >/dev/null 2>&1
-    for _ in $(seq 1 40); do
-      oom="$($RUN $DOCKER inspect -f '{{.State.OOMKilled}}' tx-oom 2>/dev/null)"
+    # The benchmark's own client buffers count against the limit while it runs, so usage drops
+    # once it ends. Pin the limit just above what is really stored, so the result is repeatable.
+    used="$($RUN $DOCKER exec tx-redis redis-cli info memory 2>/dev/null | tr -d '\r' | awk -F: '/^used_memory:/{print $2}')"
+    if [ -n "$used" ]; then
+      $RUN $DOCKER exec tx-redis redis-cli config set maxmemory "$(( used * 108 / 100 ))" >/dev/null 2>&1
+    fi
+    for _ in $(seq 1 45); do
+      running="$($RUN $DOCKER inspect -f '{{.State.Running}}' tx-oom 2>/dev/null)"
       sick="$($RUN $DOCKER inspect -f '{{.State.Health.Status}}' tx-sick 2>/dev/null)"
-      [ "$oom" = true ] && [ "$sick" = unhealthy ] && break; sleep 1
+      [ "$running" = false ] && [ "$sick" = unhealthy ] && break; sleep 1
     done
     sleep 3
   fi
 
+  FAIL_BEFORE=$FAIL
   tx TRIAGEX_REDIS_ADDR=127.0.0.1:16379 "$TRIAGEX" --json >"$WORK/dock.json" 2>"$WORK/dock.err"
   if [ ! -s "$WORK/dock.json" ]; then
     bad "triagex produced no output: $(head -3 "$WORK/dock.err")"
   else
     if [ "$(json_get "$WORK/dock.json" "len([c for c in (d.get('docker') or {}).get('containers', []) if c['name'].startswith('tx-')])")" -ge 5 ] 2>/dev/null; then ok "all test containers discovered"; else bad "test containers were not discovered (skipped: $(json_get "$WORK/dock.json" "d['skipped']"))"; fi
     expect_id "$WORK/dock.json" 'docker\.exited:tx-crash'  "crashed container (exit 3) flagged"
-    expect_id "$WORK/dock.json" 'docker\.oom:tx-oom'       "OOM-killed container flagged"
+    expect_id "$WORK/dock.json" 'docker\.oom:tx-oom'       "OOM-killed container flagged (flag, or exit 137 with a limit)"
     expect_id "$WORK/dock.json" 'docker\.health:tx-sick'   "failing health check flagged"
     expect_id "$WORK/dock.json" 'docker\.(restarting|restarts):tx-loop' "crash-looping container flagged"
     expect_no_id "$WORK/dock.json" 'docker\..*:tx-ok'      "healthy container stays quiet"
     expect_id "$WORK/dock.json" 'redis\.evictions'         "Redis evictions flagged"
     expect_id "$WORK/dock.json" 'redis\.memory'            "Redis near its memory limit flagged"
+    [ "$FAIL" -gt "$FAIL_BEFORE" ] && show_context
   fi
   tx TRIAGEX_REDIS_ADDR=127.0.0.1:16380 "$TRIAGEX" --json >"$WORK/auth.json" 2>/dev/null
   if [ -s "$WORK/auth.json" ] && [ "$(json_get "$WORK/auth.json" "any('requires a password' in s for s in d['skipped'])")" = True ]; then ok "password-protected Redis is reported, not bypassed"; else bad "password-protected Redis was not reported"; fi

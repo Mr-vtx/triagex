@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::{
     Meter, Snapshot,
-    collectors::{docker::DockerInfo, redis::RedisInfo},
+    collectors::{docker::DockerInfo, nginx::NginxInfo, process::ProcessInfo, redis::RedisInfo},
     finding::{Finding, Severity},
     host::{self, HostInfo},
     logs::{GroupView, LogOptions, analyze},
@@ -30,6 +30,9 @@ pub struct Investigation {
     pub docker: Option<DockerInfo>,
     /// None means no Redis was found (or it could not be queried).
     pub redis: Option<RedisInfo>,
+    pub nginx: Option<NginxInfo>,
+    /// None means `/proc` could not be read (see `skipped`).
+    pub processes: Option<ProcessInfo>,
     /// Present when a baseline comparison was requested (`triagex report --verify`).
     pub integrity: Option<crate::integrity::VerifyReport>,
     pub findings: Vec<Finding>,
@@ -60,6 +63,8 @@ pub fn investigate(opts: &LogOptions) -> Investigation {
     let failed_units = snap.failed_units.clone();
     let docker = snap.docker.clone();
     let redis = snap.redis.clone();
+    let nginx = snap.nginx.clone();
+    let processes = snap.processes.clone();
     let mut findings = rules::evaluate(&snap);
     let mut skipped = snap.skipped;
 
@@ -79,6 +84,8 @@ pub fn investigate(opts: &LogOptions) -> Investigation {
         failed_units,
         docker,
         redis,
+        nginx,
+        processes,
         integrity: None,
         findings,
         log_sources: logs.sources,

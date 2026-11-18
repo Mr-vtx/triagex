@@ -157,6 +157,14 @@ pub fn parse_line(raw: &str, ctx: &ParseContext, default_program: &str) -> LogLi
     } else {
         (None, raw)
     };
+    // nginx error logs have no program name; recognise them by their own format.
+    if let Some(message) = super::nginx::clean_line(rest) {
+        return LogLine {
+            timestamp,
+            program: super::nginx::PROGRAM.to_string(),
+            message,
+        };
+    }
     let (program, message) = split_program(rest);
     LogLine {
         timestamp,
@@ -213,15 +221,18 @@ mod tests {
     }
 
     #[test]
-    fn parses_nginx_style_and_uses_default_program() {
+    fn recognises_nginx_error_lines_whatever_the_file_is_called() {
         let l = parse_line(
             "2026/10/27 09:47:01 [error] 12#12: *5 connect() failed (111: Connection refused)",
             &ctx(),
             "error.log",
         );
         assert_eq!(l.timestamp, Some(civil_to_epoch(2026, 10, 27, 9, 47, 1)));
-        assert_eq!(l.program, "error.log");
-        assert!(l.message.starts_with("[error]"));
+        assert_eq!(l.program, "nginx");
+        assert_eq!(
+            l.message,
+            "[error] connect() failed (111: Connection refused)"
+        );
     }
 
     #[test]

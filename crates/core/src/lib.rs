@@ -1,6 +1,7 @@
 //! Triagex core: collect system facts, apply transparent rules, emit findings.
 //! Read-only: this crate never modifies the system it inspects.
 
+pub mod anonymize;
 pub mod collectors;
 pub mod finding;
 pub mod host;
@@ -13,7 +14,8 @@ pub mod time;
 pub mod util;
 
 use collectors::{
-    cpu::LoadInfo, disk::DiskInfo, docker::DockerInfo, memory::MemInfo, redis::RedisInfo,
+    cpu::LoadInfo, disk::DiskInfo, docker::DockerInfo, memory::MemInfo, nginx::NginxInfo,
+    process::ProcessInfo, redis::RedisInfo,
 };
 use finding::{Report, Severity};
 use serde::Serialize;
@@ -44,6 +46,9 @@ pub struct Snapshot {
     pub docker: Option<DockerInfo>,
     /// None means no Redis was found, or it could not be queried (see `skipped`).
     pub redis: Option<RedisInfo>,
+    pub nginx: Option<NginxInfo>,
+    /// None means `/proc` could not be read (see `skipped`).
+    pub processes: Option<ProcessInfo>,
     /// Checks that could not run, with the reason. Never silently dropped.
     pub skipped: Vec<String>,
 }
@@ -51,6 +56,16 @@ pub struct Snapshot {
 impl Snapshot {
     pub fn collect() -> Self {
         let mut skipped = Vec::new();
+
+        // CPU% needs two readings. The first is taken now and the second at the very end,
+        // so the wait is spent on the other checks instead of adding to the run time.
+        let sampler = match collectors::process::Sampler::start() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                skipped.push(format!("processes: {e}"));
+                None
+            }
+        };
 
         let load = match collectors::cpu::collect() {
             Ok(v) => Some(v),
@@ -98,6 +113,37 @@ impl Snapshot {
             }
         };
 
+        let nginx = match collectors::nginx::collect() {
+            Ok(v) => {
+                use collectors::nginx::ConfigState;
+                match v.as_ref().map(|n| n.config.state) {
+                    Some(ConfigState::NeedsRoot) => skipped.push(
+                        "nginx -t needs root to open log files and certificates (try sudo)".into(),
+                    ),
+                    Some(ConfigState::TimedOut) => {
+                        skipped.push("nginx -t did not finish in time".into())
+                    }
+                    _ => {}
+                }
+                v
+            }
+            Err(e) => {
+                skipped.push(e);
+                None
+            }
+        };
+
+        let processes = sampler.and_then(|s| {
+            let total = memory.as_ref().map(|m| m.total_kb * 1024);
+            match s.finish(total) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    skipped.push(format!("processes: {e}"));
+                    None
+                }
+            }
+        });
+
         Snapshot {
             hostname: hostname(),
             load,
@@ -106,6 +152,8 @@ impl Snapshot {
             failed_units,
             docker,
             redis,
+            nginx,
+            processes,
             skipped,
         }
     }
@@ -263,6 +311,34 @@ impl Snapshot {
                 human_bytes(r.used_memory)
             ));
         }
+        if let Some(n) = &self.nginx {
+            use collectors::nginx::ConfigState;
+            let config = match n.config.state {
+                ConfigState::Passed => "config ok",
+                ConfigState::Failed => "config test FAILED",
+                ConfigState::NeedsRoot => "config not tested (needs root)",
+                ConfigState::TimedOut => "config test timed out",
+                ConfigState::NotRun => "config not tested (no nginx binary here)",
+            };
+            let live = match &n.status {
+                Some(s) => format!(", {} active connections", s.active),
+                None => String::new(),
+            };
+            out.push(format!(
+                "nginx: {}, {} process(es), {config}{live}",
+                n.version.as_deref().unwrap_or("unknown version"),
+                n.processes
+            ));
+        }
+        if let Some(p) = &self.processes {
+            out.push(format!(
+                "processes: {} total ({} running, {} zombie, {} stuck in disk wait)",
+                p.total,
+                p.running,
+                p.zombies,
+                p.stuck.len()
+            ));
+        }
         if let Some(d) = &self.docker {
             out.push(format!(
                 "docker: {} containers ({} running, {} stopped, {} with problems)",
@@ -325,6 +401,8 @@ mod tests {
             failed_units: Some(vec![]),
             docker: None,
             redis: None,
+            nginx: None,
+            processes: None,
             skipped: vec![],
         }
     }
