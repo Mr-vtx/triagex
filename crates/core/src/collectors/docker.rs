@@ -4,16 +4,18 @@
 
 use std::{
     io::{self, Read, Write},
-    os::unix::net::UnixStream,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
 
+use crate::guard;
+
 const MAX_RESPONSE: u64 = 16 * 1024 * 1024;
 const MAX_INSPECT: usize = 64;
 const TIMEOUT: Duration = Duration::from_secs(3);
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ContainerInfo {
@@ -172,9 +174,9 @@ fn parse_http(raw: &[u8]) -> io::Result<(u16, Vec<u8>)> {
 }
 
 fn get(socket: &Path, path: &str) -> io::Result<(u16, Vec<u8>)> {
-    let mut stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(TIMEOUT))?;
-    stream.set_write_timeout(Some(TIMEOUT))?;
+    let mut stream = guard::unix_connect(socket, guard::clamp(CONNECT_TIMEOUT))?;
+    stream.set_read_timeout(Some(guard::clamp(TIMEOUT)))?;
+    stream.set_write_timeout(Some(guard::clamp(TIMEOUT)))?;
     write!(
         stream,
         "GET {path} HTTP/1.1\r\nHost: docker\r\nUser-Agent: triagex\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
@@ -477,5 +479,20 @@ mod tests {
     fn a_missing_socket_is_a_clear_error() {
         let err = collect_from(Path::new("/definitely/not/a.sock")).unwrap_err();
         assert!(err.starts_with("docker:"));
+    }
+
+    #[test]
+    fn a_socket_that_never_accepts_gives_an_error_instead_of_hanging() {
+        let path =
+            std::env::temp_dir().join(format!("tx-docker-wedged-{}.sock", std::process::id()));
+        std::fs::remove_file(&path).ok();
+        let _listener = guard::wedged_listener(&path);
+        // Take the one queued slot; the daemon "never accepts" it.
+        let _first = guard::unix_connect(&path, Duration::from_secs(1)).unwrap();
+        let started = std::time::Instant::now();
+        let err = collect_from(&path).unwrap_err();
+        assert!(err.contains("did not accept the connection"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::fs::remove_file(&path).ok();
     }
 }

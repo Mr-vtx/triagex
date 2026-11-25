@@ -5,18 +5,30 @@
 #   ./scripts/vps-run.sh user@host --sudo         # also run with `sudo -n` (needs passwordless sudo)
 #   ./scripts/vps-run.sh user@host --raw          # do NOT anonymize (results stay private!)
 #   ./scripts/vps-run.sh user@host --binary PATH --out DIR --keep
+#   ./scripts/vps-run.sh user@host --remote-dir /var/tmp --step-timeout 300 --total-timeout 1800
 #
-# It copies one binary to a temporary folder in the server's home directory, runs every
-# command, copies the results back, and removes everything it created. It never changes
-# anything outside that folder and its own baseline file.
+# It copies one binary to a temporary folder on the server, runs every command, copies the
+# results back, and removes everything it created. It never changes anything outside that
+# folder and its own baseline file.
+#
+# The folder is on local disk: it tries /var/tmp, /tmp, /dev/shm and only then the home
+# directory, and skips anything that is network storage (NFS, autofs, ...) or noexec, because
+# a home directory on a hung NFS mount would hang the run. --remote-dir picks the place yourself.
+# Nothing here can wait forever: ssh sends keepalives, every step has a time limit
+# (--step-timeout, default 900 s), and so does the whole run (--total-timeout, default 3600 s).
 set -u
 cd "$(dirname "$0")/.." || exit 2
 
 SSH="${SSH:-ssh}"; SCP="${SCP:-scp}"
-SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
+# ServerAlive*: a connection that goes silent is dropped after ~45 s instead of hanging.
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
 TARGET=""; USE_SUDO=0; ANON=1; KEEP=0; OUT=""; BIN=""
+REMOTE_BASE=""; STEP_TIMEOUT=900; TOTAL_TIMEOUT=3600
 
-usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-2}"; }
+usage() { sed -n '2,/^set -u/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit "${1:-2}"; }
+
+# Run a local command with a time limit (when `timeout` exists). Exit 124 means it timed out.
+tlimit() { local secs="$1"; shift; if command -v timeout >/dev/null 2>&1; then timeout -k 5 "$secs" "$@"; else "$@"; fi; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --sudo) USE_SUDO=1 ;;
@@ -24,6 +36,9 @@ while [ $# -gt 0 ]; do
     --keep) KEEP=1 ;;
     --binary) BIN="${2:?--binary needs a path}"; shift ;;
     --out) OUT="${2:?--out needs a directory}"; shift ;;
+    --remote-dir) REMOTE_BASE="${2:?--remote-dir needs a directory}"; shift ;;
+    --step-timeout) STEP_TIMEOUT="${2:?--step-timeout needs seconds}"; shift ;;
+    --total-timeout) TOTAL_TIMEOUT="${2:?--total-timeout needs seconds}"; shift ;;
     -h|--help) usage 0 ;;
     -*) echo "unknown option: $1" >&2; usage ;;
     *) [ -z "$TARGET" ] && TARGET="$1" || { echo "unexpected argument: $1" >&2; usage; } ;;
@@ -31,6 +46,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 [ -n "$TARGET" ] || usage
+case "$STEP_TIMEOUT$TOTAL_TIMEOUT" in *[!0-9]*|"") echo "--step-timeout and --total-timeout take whole seconds" >&2; exit 2 ;; esac
 
 # ---- the binary
 if [ -z "$BIN" ]; then
@@ -44,7 +60,7 @@ if ldd "$BIN" 2>&1 | grep -q "=>"; then
 fi
 
 echo "== connecting to $TARGET"
-remote_arch="$($SSH "${SSH_OPTS[@]}" "$TARGET" uname -m 2>/dev/null)" || { echo "cannot reach $TARGET over ssh (keys set up? try: ssh $TARGET)" >&2; exit 1; }
+remote_arch="$(tlimit 60 $SSH "${SSH_OPTS[@]}" "$TARGET" uname -m 2>/dev/null)" || { echo "cannot reach $TARGET over ssh (keys set up? try: ssh $TARGET)" >&2; exit 1; }
 case "$(file -b "$BIN")" in
   *x86-64*) local_arch=x86_64 ;; *aarch64*|*ARM\ aarch64*) local_arch=aarch64 ;; *) local_arch="$remote_arch" ;;
 esac
@@ -56,22 +72,51 @@ echo "   server architecture: $remote_arch (binary matches)"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 [ -n "$OUT" ] || OUT="vps-results-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$OUT"
-RDIR="triagex-vps-run"
+
+# ---- where on the server to work: local, writable, executable, not network storage
+pick_remote_dir() {
+  tlimit 60 $SSH "${SSH_OPTS[@]}" "$TARGET" bash -s -- "$REMOTE_BASE" <<'PICK'
+base="$1"
+local_fs() { # false for network storage; true when unknown
+  case "$(stat -f -c %T "$1" 2>/dev/null)" in nfs*|autofs|cifs|smb*|fuse*|ceph|afs|9p|lustre|gpfs) return 1 ;; *) return 0 ;; esac
+}
+try() {
+  d="$1/triagex-vps-run"
+  mkdir -p "$d" 2>/dev/null || return 1
+  local_fs "$d" || return 1
+  printf '#!/bin/sh\nexit 0\n' > "$d/.probe" 2>/dev/null && chmod 755 "$d/.probe" 2>/dev/null && "$d/.probe" || { rm -f "$d/.probe"; return 1; }
+  rm -f "$d/.probe"
+  echo "$d"
+}
+if [ -n "$base" ]; then
+  try "$base" && exit 0
+  echo "$base is not usable: not writable, network storage, or mounted noexec" >&2; exit 1
+fi
+for b in /var/tmp /tmp /dev/shm "$HOME"; do try "$b" && exit 0; done
+echo "no local, writable, executable directory found" >&2; exit 1
+PICK
+}
+RDIR="$(pick_remote_dir)" || { echo "cannot find a place to work on $TARGET (try --remote-dir /some/local/dir)" >&2; exit 1; }
+case "$RDIR" in /*/triagex-vps-run) ;; *) echo "unexpected remote directory: $RDIR" >&2; exit 1 ;; esac
+echo "   working directory on the server: $RDIR"
 
 # ---- the script that runs on the server
 cat > "$WORK/remote.sh" <<'REMOTE'
 set -u
-SUDO="$1"; ANON="$2"
-cd "$HOME/triagex-vps-run" || exit 2
-rm -rf out && mkdir -p out fixture
+SUDO="$1"; ANON="$2"; RDIR="$3"; STEP_TIMEOUT="$4"
+cd "$RDIR" || exit 2
+# Keep baselines in the working directory too: a home directory may be network storage.
+export XDG_DATA_HOME="$RDIR/data"
+rm -rf out && mkdir -p out fixture data
 : > out/summary.tsv
 X="--color never --no-banner"
 [ "$ANON" = 1 ] && X="$X --anonymize"
 T=./triagex
 
-step() { # name command...
+TL=""; command -v timeout >/dev/null 2>&1 && TL="timeout -k 5 $STEP_TIMEOUT"
+step() { # name command...   (a step that outlives the time limit is killed and exits 124)
   name="$1"; shift
-  s=$(date +%s.%N); "$@" > "out/$name.txt" 2>&1; rc=$?; e=$(date +%s.%N)
+  s=$(date +%s.%N); $TL "$@" > "out/$name.txt" 2>&1; rc=$?; e=$(date +%s.%N)
   printf '%s\t%s\t%s\n' "$name" "$rc" "$(awk -v a="$s" -v b="$e" 'BEGIN{printf "%.2f", b-a}')" >> out/summary.tsv
 }
 
@@ -120,14 +165,19 @@ exit 0
 REMOTE
 
 # ---- copy, run, collect
-$SSH "${SSH_OPTS[@]}" "$TARGET" "mkdir -p $RDIR" || exit 1
-$SCP -q "${SSH_OPTS[@]}" "$BIN" "$TARGET:$RDIR/triagex" || { echo "copy failed" >&2; exit 1; }
-$SSH "${SSH_OPTS[@]}" "$TARGET" "chmod 755 $RDIR/triagex"
+tlimit 180 $SCP -q "${SSH_OPTS[@]}" "$BIN" "$TARGET:$RDIR/triagex" || { echo "copy failed or timed out" >&2; exit 1; }
+tlimit 60 $SSH "${SSH_OPTS[@]}" "$TARGET" "chmod 755 '$RDIR/triagex'"
 sudo_cmd=""; [ "$USE_SUDO" = 1 ] && sudo_cmd="sudo -n"
 echo "== running (anonymize: $([ "$ANON" = 1 ] && echo yes || echo NO), sudo: $([ "$USE_SUDO" = 1 ] && echo yes || echo no))"
-$SSH "${SSH_OPTS[@]}" "$TARGET" "bash -s -- '$sudo_cmd' '$ANON'" < "$WORK/remote.sh" || echo "(the remote script reported a problem)"
-$SCP -q -r "${SSH_OPTS[@]}" "$TARGET:$RDIR/out/." "$OUT/" || { echo "could not copy results back" >&2; exit 1; }
-[ "$KEEP" = 1 ] || $SSH "${SSH_OPTS[@]}" "$TARGET" "rm -rf $RDIR"
+tlimit "$TOTAL_TIMEOUT" $SSH "${SSH_OPTS[@]}" "$TARGET" "bash -s -- '$sudo_cmd' '$ANON' '$RDIR' '$STEP_TIMEOUT'" < "$WORK/remote.sh"
+rc=$?
+if [ "$rc" = 124 ]; then
+  echo "(the run hit --total-timeout of $TOTAL_TIMEOUT s; collecting whatever finished)"
+elif [ "$rc" != 0 ]; then
+  echo "(the remote script reported a problem, exit $rc)"
+fi
+tlimit 300 $SCP -q -r "${SSH_OPTS[@]}" "$TARGET:$RDIR/out/." "$OUT/" || { echo "could not copy results back" >&2; exit 1; }
+[ "$KEEP" = 1 ] || tlimit 60 $SSH "${SSH_OPTS[@]}" "$TARGET" "rm -rf '$RDIR'"
 
 # ---- summary
 echo
@@ -136,6 +186,7 @@ printf '   %-22s %-6s %s\n' STEP EXIT SECONDS
 while IFS=$'\t' read -r name rc secs; do
   case "$rc" in
     0) note="" ;; 1) note="(warnings found)" ;; 2) note="(critical findings)" ;;
+    124) note="<-- TIMED OUT (triagex's own deadline, or --step-timeout): something on that host hung; read $name.txt" ;;
     *) note="<-- ERROR, read $name.txt" ;;
   esac
   printf '   %-22s %-6s %-8s %s\n' "$name" "$rc" "$secs" "$note"

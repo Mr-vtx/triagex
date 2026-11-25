@@ -1,4 +1,9 @@
-use std::{collections::HashSet, ffi::CString, fs, io};
+use std::{collections::HashSet, ffi::CString, fs, io, time::Duration};
+
+use crate::guard;
+
+/// A filesystem that does not answer `statvfs` in this long is hung (dead disk, lost iSCSI path).
+const STAT_TIMEOUT: Duration = Duration::from_secs(3);
 
 const REAL_FS: &[&str] = &[
     "ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs", "vfat", "exfat", "ntfs", "ntfs3", "jfs",
@@ -86,9 +91,17 @@ fn stat(m: &MountEntry) -> Option<DiskInfo> {
 }
 
 pub fn collect() -> io::Result<Vec<DiskInfo>> {
+    collect_with_notes().map(|(disks, _)| disks)
+}
+
+/// Disks, plus one note for each filesystem that did not answer in time. `statvfs` on a hung
+/// filesystem blocks in the kernel, so each one is asked on its own helper thread: a dead disk
+/// costs a few seconds and one note, not the run.
+pub fn collect_with_notes() -> io::Result<(Vec<DiskInfo>, Vec<String>)> {
     let raw = fs::read_to_string("/proc/mounts")?;
     let mut seen = HashSet::new();
     let mut out = Vec::new();
+    let mut notes = Vec::new();
     for m in parse_mounts(&raw) {
         if !REAL_FS.contains(&m.fstype.as_str()) {
             continue;
@@ -96,11 +109,17 @@ pub fn collect() -> io::Result<Vec<DiskInfo>> {
         if !seen.insert(m.device.clone()) {
             continue;
         }
-        if let Some(info) = stat(&m) {
-            out.push(info);
+        let mount = m.mount.clone();
+        match guard::run_with_timeout(STAT_TIMEOUT, move || stat(&m)) {
+            Some(Some(info)) => out.push(info),
+            Some(None) => {}
+            None => notes.push(format!(
+                "disk {mount}: no answer within {} s (the storage may be hung)",
+                STAT_TIMEOUT.as_secs()
+            )),
         }
     }
-    Ok(out)
+    Ok((out, notes))
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@
 pub mod anonymize;
 pub mod collectors;
 pub mod finding;
+pub mod guard;
 pub mod host;
 pub mod integrity;
 pub mod investigation;
@@ -53,6 +54,17 @@ pub struct Snapshot {
     pub skipped: Vec<String>,
 }
 
+/// True, and noted, once the run deadline has passed: the check is skipped by name instead of
+/// being started and left to hang.
+fn out_of_time(skipped: &mut Vec<String>, what: &str) -> bool {
+    if guard::expired() {
+        skipped.push(format!("{what}: skipped, the run deadline passed"));
+        true
+    } else {
+        false
+    }
+}
+
 impl Snapshot {
     pub fn collect() -> Self {
         let mut skipped = Vec::new();
@@ -81,55 +93,77 @@ impl Snapshot {
                 None
             }
         };
-        let disks = match collectors::disk::collect() {
-            Ok(v) => v,
+        let disks = match collectors::disk::collect_with_notes() {
+            Ok((v, notes)) => {
+                skipped.extend(notes);
+                v
+            }
             Err(e) => {
                 skipped.push(format!("disk: {e}"));
                 Vec::new()
             }
         };
 
-        let failed_units = match collectors::systemd::collect() {
-            Ok(v) => Some(v),
-            Err(e) => {
-                skipped.push(format!("systemd: {e}"));
-                None
-            }
-        };
-
-        let docker = match collectors::docker::collect() {
-            Ok(v) => v,
-            Err(e) => {
-                skipped.push(e);
-                None
-            }
-        };
-
-        let redis = match collectors::redis::collect() {
-            Ok(v) => v,
-            Err(e) => {
-                skipped.push(e);
-                None
-            }
-        };
-
-        let nginx = match collectors::nginx::collect() {
-            Ok(v) => {
-                use collectors::nginx::ConfigState;
-                match v.as_ref().map(|n| n.config.state) {
-                    Some(ConfigState::NeedsRoot) => skipped.push(
-                        "nginx -t needs root to open log files and certificates (try sudo)".into(),
-                    ),
-                    Some(ConfigState::TimedOut) => {
-                        skipped.push("nginx -t did not finish in time".into())
-                    }
-                    _ => {}
+        // Each check below has its own timeouts, shortened to fit the run deadline. Once the
+        // deadline has passed the rest are skipped by name rather than started.
+        let failed_units = if out_of_time(&mut skipped, "systemd") {
+            None
+        } else {
+            match collectors::systemd::collect() {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    skipped.push(format!("systemd: {e}"));
+                    None
                 }
-                v
             }
-            Err(e) => {
-                skipped.push(e);
-                None
+        };
+
+        let docker = if out_of_time(&mut skipped, "docker") {
+            None
+        } else {
+            match collectors::docker::collect() {
+                Ok(v) => v,
+                Err(e) => {
+                    skipped.push(e);
+                    None
+                }
+            }
+        };
+
+        let redis = if out_of_time(&mut skipped, "redis") {
+            None
+        } else {
+            match collectors::redis::collect() {
+                Ok(v) => v,
+                Err(e) => {
+                    skipped.push(e);
+                    None
+                }
+            }
+        };
+
+        let nginx = if out_of_time(&mut skipped, "nginx") {
+            None
+        } else {
+            match collectors::nginx::collect() {
+                Ok(v) => {
+                    use collectors::nginx::ConfigState;
+                    match v.as_ref().map(|n| n.config.state) {
+                        Some(ConfigState::NeedsRoot) => skipped.push(
+                            "nginx -t needs root to open log files and certificates (try sudo)"
+                                .into(),
+                        ),
+                        Some(ConfigState::TimedOut) => {
+                            skipped.push("nginx -t did not finish in time".into())
+                        }
+                        _ => {}
+                    }
+                    v
+                }
+                Err(e) => {
+                    skipped.push(e);
+                    None
+                }
             }
         };
 

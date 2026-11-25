@@ -15,12 +15,13 @@ use std::{
     io::{self, Read, Write},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
     path::Path,
-    process::{Command, Stdio},
-    thread,
-    time::{Duration, Instant},
+    process::Command,
+    time::Duration,
 };
 
 use serde::Serialize;
+
+use crate::guard;
 
 const BINARY_CANDIDATES: [&str; 6] = [
     "/usr/sbin/nginx",
@@ -253,7 +254,7 @@ pub fn fetch_status(url: &str) -> Result<StubStatus, String> {
     let (host, port, path) =
         parse_url(url).ok_or_else(|| format!("not a plain http URL: {url}"))?;
     let addr = loopback_addr(&host, port)?;
-    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+    let mut stream = TcpStream::connect_timeout(&addr, guard::clamp(CONNECT_TIMEOUT))
         .map_err(|e| format!("cannot connect to {addr}: {e}"))?;
     stream.set_read_timeout(Some(IO_TIMEOUT)).ok();
     stream.set_write_timeout(Some(IO_TIMEOUT)).ok();
@@ -289,48 +290,18 @@ struct Captured {
     text: String,
 }
 
-/// Runs a command with a deadline and returns stdout and stderr together.
+/// Runs a command with a deadline and returns stdout and stderr together. Ok(None) means the
+/// deadline passed. The kill is not waited on (see `guard::run_command`): a hung nginx in
+/// uninterruptible sleep survives SIGKILL, and waiting for it would hang us as well.
 fn run_capture(bin: &str, arg: &str, timeout: Duration) -> io::Result<Option<Captured>> {
-    let mut child = Command::new(bin)
-        .arg(arg)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let mut readers = Vec::new();
-    if let Some(o) = child.stdout.take() {
-        readers.push(thread::spawn(move || read_limited(o)));
-    }
-    if let Some(e) = child.stderr.take() {
-        readers.push(thread::spawn(move || read_limited(e)));
-    }
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(s) = child.try_wait()? {
-            break Some(s);
-        }
-        if Instant::now() >= deadline {
-            child.kill().ok();
-            child.wait().ok();
-            break None;
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
-    let text: String = readers
-        .into_iter()
-        .filter_map(|h| h.join().ok())
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok(status.map(|s| Captured {
-        ok: s.success(),
-        text,
-    }))
-}
-
-fn read_limited<R: Read>(r: R) -> String {
-    let mut buf = Vec::new();
-    r.take(MAX_OUTPUT).read_to_end(&mut buf).ok();
-    String::from_utf8_lossy(&buf).into_owned()
+    let mut cmd = Command::new(bin);
+    cmd.arg(arg);
+    Ok(
+        guard::run_command(cmd, timeout, MAX_OUTPUT as usize)?.map(|o| Captured {
+            ok: o.success,
+            text: o.combined(),
+        }),
+    )
 }
 
 /// Fixed install locations first: a PATH can be anything, and this may run as root.
@@ -442,7 +413,7 @@ pub fn collect() -> Result<Option<NginxInfo>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
+    use std::{net::TcpListener, thread, time::Instant};
 
     #[test]
     fn a_passing_test() {

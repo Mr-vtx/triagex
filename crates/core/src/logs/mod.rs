@@ -261,7 +261,12 @@ pub fn analyze(opts: &LogOptions) -> LogReport {
                 scanned += ing.scanned;
                 matched += ing.matched;
             }
-            Err(e) => skipped.push(e),
+            Err(e) => {
+                // Lines read before the failure are already grouped; count them too.
+                scanned += ing.scanned;
+                matched += ing.matched;
+                skipped.push(e);
+            }
         }
     }
 
@@ -293,7 +298,11 @@ pub fn analyze(opts: &LogOptions) -> LogReport {
                     path.display()
                 ));
             }
-            Err(e) => skipped.push(format!("{}: {e}", path.display())),
+            Err(e) => {
+                scanned += ing.scanned;
+                matched += ing.matched;
+                skipped.push(format!("{}: {e}", path.display()));
+            }
         }
     }
 

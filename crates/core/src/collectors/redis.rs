@@ -8,11 +8,13 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
     os::unix::net::UnixStream,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use serde::Serialize;
+
+use crate::guard;
 
 const TIMEOUT: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
@@ -199,7 +201,7 @@ fn probe<S: Read + Write>(stream: S, addr: &str) -> Result<RedisInfo, String> {
 
 pub fn probe_tcp(addr: SocketAddr) -> Result<RedisInfo, String> {
     let label = addr.to_string();
-    let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+    let stream = TcpStream::connect_timeout(&addr, guard::clamp(CONNECT_TIMEOUT))
         .map_err(|e| format!("redis: {label}: {e}"))?;
     stream.set_read_timeout(Some(TIMEOUT)).ok();
     stream.set_write_timeout(Some(TIMEOUT)).ok();
@@ -239,6 +241,29 @@ fn is_absent(e: &io::Error) -> bool {
     )
 }
 
+/// Connects to a Redis Unix socket. Ok(None): there is no socket here (not an error). Err: a
+/// socket exists but cannot be used, and the reason says why. A socket that exists yet does not
+/// accept a connection is a wedged server, which is worth reporting rather than hiding as
+/// "no Redis here".
+fn connect_unix(path: &Path) -> Result<Option<UnixStream>, String> {
+    if std::fs::metadata(path).is_err() {
+        return Ok(None);
+    }
+    let label = path.display().to_string();
+    match guard::unix_connect(path, guard::clamp(CONNECT_TIMEOUT)) {
+        Ok(stream) => Ok(Some(stream)),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Err(format!(
+            "redis: permission denied on {label} (run with sudo or join the redis group)"
+        )),
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => Err(format!(
+            "redis: {label} exists but did not accept a connection within {} ms (is redis hung?)",
+            CONNECT_TIMEOUT.as_millis()
+        )),
+        Err(e) if is_absent(&e) => Ok(None),
+        Err(e) => Err(format!("redis: {label}: {e}")),
+    }
+}
+
 /// Ok(None) means no Redis was found, which is not an error.
 pub fn collect() -> Result<Option<RedisInfo>, String> {
     for target in targets() {
@@ -249,7 +274,7 @@ pub fn collect() -> Result<Option<RedisInfo>, String> {
                     .ok()
                     .and_then(|mut it| it.next())
                     .ok_or_else(|| format!("redis: cannot resolve address {addr}"))?;
-                match TcpStream::connect_timeout(&resolved, CONNECT_TIMEOUT) {
+                match TcpStream::connect_timeout(&resolved, guard::clamp(CONNECT_TIMEOUT)) {
                     Ok(stream) => {
                         stream.set_read_timeout(Some(TIMEOUT)).ok();
                         stream.set_write_timeout(Some(TIMEOUT)).ok();
@@ -260,23 +285,14 @@ pub fn collect() -> Result<Option<RedisInfo>, String> {
                 }
             }
             Target::Unix(path) => {
-                if std::fs::metadata(&path).is_err() {
-                    continue;
-                }
                 let label = path.display().to_string();
-                match UnixStream::connect(&path) {
-                    Ok(stream) => {
-                        stream.set_read_timeout(Some(TIMEOUT)).ok();
-                        stream.set_write_timeout(Some(TIMEOUT)).ok();
+                match connect_unix(&path)? {
+                    Some(stream) => {
+                        stream.set_read_timeout(Some(guard::clamp(TIMEOUT))).ok();
+                        stream.set_write_timeout(Some(guard::clamp(TIMEOUT))).ok();
                         return probe(stream, &label).map(Some);
                     }
-                    Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                        return Err(format!(
-                            "redis: permission denied on {label} (run with sudo or join the redis group)"
-                        ));
-                    }
-                    Err(e) if is_absent(&e) => continue,
-                    Err(e) => return Err(format!("redis: {label}: {e}")),
+                    None => continue,
                 }
             }
         }
@@ -413,5 +429,37 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
         assert!(probe_tcp(addr).is_err());
+    }
+
+    #[test]
+    fn a_socket_that_never_accepts_is_reported_not_hidden() {
+        let path =
+            std::env::temp_dir().join(format!("tx-redis-wedged-{}.sock", std::process::id()));
+        std::fs::remove_file(&path).ok();
+        let _listener = guard::wedged_listener(&path);
+        let started = Instant::now();
+        let mut held = Vec::new();
+        let mut outcome = None;
+        for _ in 0..4 {
+            match connect_unix(&path) {
+                Ok(Some(s)) => held.push(s),
+                other => {
+                    outcome = Some(other);
+                    break;
+                }
+            }
+        }
+        let err = outcome.expect("the backlog never filled").unwrap_err();
+        assert!(err.contains("did not accept a connection"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_missing_socket_means_no_redis_here() {
+        assert!(matches!(
+            connect_unix(Path::new("/nonexistent/triagex-redis.sock")),
+            Ok(None)
+        ));
     }
 }

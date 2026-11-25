@@ -11,9 +11,9 @@ From your laptop, with SSH key access to the server:
 ./scripts/vps-run.sh user@your-server --sudo
 ```
 
-It copies the binary to a temporary folder in the server's home directory, runs 11 steps, copies the results back to `vps-results-<timestamp>/`, prints a summary table, and removes everything it created (including its baselines). Results are **anonymized by default**.
+It copies the binary to a temporary folder on the server's local disk (`/var/tmp`, `/tmp`, `/dev/shm`, then the home directory; network storage and `noexec` mounts are skipped), runs 11 steps, copies the results back to `vps-results-<timestamp>/`, prints a summary table, and removes everything it created (including its baselines). Results are **anonymized by default**.
 
-Options: `--sudo` (also run with `sudo -n`, needs passwordless sudo), `--raw` (no anonymizing, keep private), `--keep` (leave the folder on the server), `--binary PATH`, `--out DIR`.
+Options: `--sudo` (also run with `sudo -n`, needs passwordless sudo), `--raw` (no anonymizing, keep private), `--keep` (leave the folder on the server), `--binary PATH`, `--out DIR`, `--remote-dir DIR` (choose the working directory), `--step-timeout SECS` (default 900) and `--total-timeout SECS` (default 3600). ssh sends keepalives, so a dead connection is dropped in about 45 s. A step that hits its limit shows exit `124` in the summary.
 
 ## Reading the summary
 

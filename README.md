@@ -75,9 +75,9 @@ Run with `sudo` to read protected logs, `/etc/shadow`, and the Docker socket.
 | `triagex verify` | Compare against a baseline |
 | `triagex about` | Version, codename, author, source |
 
-Useful flags (on every command): `--json`, `--since 30m|2h|1d|1w|all`, `--anonymize`, `--theme purple|green`, `--color auto|always|never`, `--compact`, `--no-banner`.
+Useful flags (on every command): `--json`, `--since 30m|2h|1d|1w|all`, `--anonymize`, `--theme purple|green`, `--color auto|always|never`, `--compact`, `--no-banner`, `--deadline SECS`.
 
-**Exit codes:** `0` all clear, `1` warnings, `2` critical, `3` Triagex itself failed. Use them in scripts and cron.
+**Exit codes:** `0` all clear, `1` warnings, `2` critical, `3` Triagex itself failed, `124` it was still running after its deadline (see [Hangs](#when-the-server-is-hung)). Use them in scripts and cron.
 
 ## What it looks at
 
@@ -144,7 +144,7 @@ sudo triagex baseline /etc /usr/local/bin --name web --exclude '/etc/mtab'
 sudo triagex verify --name web
 ```
 
-Scan-based, not real-time. Symlinks are never followed, special files are skipped, unreadable paths are reported. The baseline is stored `0600` in a `0700` directory (`/var/lib/triagex` as root, `~/.local/share/triagex` otherwise) and carries its own digest, so an edited baseline is detected. Keep the digest somewhere off the server and pass it with `verify --expect-digest`.
+Scan-based, not real-time. Symlinks are never followed, special files are skipped, unreadable paths are reported. The baseline is stored `0600` in a `0700` directory (`/var/lib/triagex` as root, `~/.local/share/triagex` otherwise) and carries its own digest, so an edited baseline is detected. Keep the digest somewhere off the server and pass it with `verify --expect-digest`. Network and automounted filesystems (NFS, CIFS, autofs, FUSE) found *below* a path are skipped by name and reported, never entered. If a scan stops making progress, `baseline` refuses to save a partial result and `verify` says the comparison is incomplete instead of calling unreached files deleted.
 
 ## Sharing output safely
 
@@ -159,6 +159,14 @@ Scan-based, not real-time. Symlinks are never followed, special files are skippe
 | `DOCKER_HOST` | `unix:///path/to/docker.sock` |
 | `NO_COLOR` | disable colors |
 | `XDG_DATA_HOME` | where non-root baselines are stored |
+| `TRIAGEX_DEADLINE` | total run limit in seconds, same as `--deadline` (`0` = none) |
+| `TRIAGEX_STALL_SECS` | how long a file scan may make no progress before it is abandoned (default 15) |
+
+### When the server is hung
+
+Triagex is what you run when a server is unhealthy, so it is built not to hang with it. Every external call has a limit: `systemctl` and `nginx` (a killed child is never waited on), Docker and Redis socket connects (a wedged daemon cannot block them), `statvfs` on each disk, log files (open and read), and `journalctl`. A check that does not answer is listed under **Skipped** with the reason, and the rest of the run carries on.
+
+`--deadline SECS` (default 120; 600 for `baseline` and `verify`; `0` disables) caps the whole run: checks still pending when it passes are skipped, and if something is blocked beyond the reach of any timeout, Triagex exits with code `124` five seconds later. The deadline covers gathering, not printing, so reading the output in a pager is never cut off. A thread stuck in the kernel cannot be cancelled; it is abandoned and ends when the call finally returns.
 
 ## Security model
 

@@ -1,4 +1,9 @@
-use std::{io::ErrorKind, process::Command};
+use std::{io::ErrorKind, process::Command, time::Duration};
+
+use crate::guard;
+
+const TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_OUTPUT: usize = 1024 * 1024;
 
 pub fn parse_failed(s: &str) -> Vec<String> {
     s.lines()
@@ -11,20 +16,30 @@ pub fn parse_failed(s: &str) -> Vec<String> {
 }
 
 pub fn collect() -> Result<Vec<String>, String> {
-    let out = Command::new("systemctl")
-        .args(["--failed", "--no-legend", "--plain", "--no-pager"])
-        .output()
+    let mut cmd = Command::new("systemctl");
+    cmd.args(["--failed", "--no-legend", "--plain", "--no-pager"]);
+    let out = guard::run_command(cmd, TIMEOUT, MAX_OUTPUT)
         .map_err(|e| {
             if e.kind() == ErrorKind::NotFound {
                 "systemctl not found".to_string()
             } else {
                 format!("could not run systemctl: {e}")
             }
+        })?
+        .ok_or_else(|| {
+            if guard::expired() {
+                "systemctl did not answer before the run deadline (systemd may be hung)".to_string()
+            } else {
+                format!(
+                    "systemctl did not answer within {} s (systemd may be hung)",
+                    TIMEOUT.as_secs()
+                )
+            }
         })?;
-    if !out.status.success() {
-        return Err(format!("systemctl exited with {}", out.status));
+    if !out.success {
+        return Err("systemctl exited with an error".to_string());
     }
-    Ok(parse_failed(&String::from_utf8_lossy(&out.stdout)))
+    Ok(parse_failed(&out.stdout))
 }
 
 #[cfg(test)]

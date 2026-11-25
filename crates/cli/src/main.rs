@@ -4,12 +4,14 @@ mod ui;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use triagex_core::{
     Snapshot,
     anonymize::Scrubber,
     finding::{Finding, Severity},
+    guard,
     integrity::{self, DEFAULT_MAX_FILES, DEFAULT_MAX_HASH_MB, ScanOptions},
     investigation::{Investigation, investigate},
     logs::{LogOptions, analyze},
@@ -56,6 +58,11 @@ struct Cli {
     /// Hide IP addresses, the hostname and your user name (for screenshots and bug reports)
     #[arg(long, global = true)]
     anonymize: bool,
+
+    /// Stop after this many seconds and report what was gathered, with the rest listed as
+    /// skipped (0 = no limit; or set TRIAGEX_DEADLINE). Default: 120, and 600 for baseline and verify
+    #[arg(long, global = true, value_name = "SECS")]
+    deadline: Option<u64>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -186,6 +193,14 @@ fn main() -> ExitCode {
     // The big logo only appears when colors are on (a real terminal), never in pipes or logs.
     let banner = ui.color && !cli.no_banner;
 
+    // A total-run deadline: slow checks are cut short and listed as skipped. The watchdog is
+    // the backstop for anything blocked beyond the reach of a timeout; each command disarms it
+    // once it has everything, so reading the output is never cut off.
+    let secs = run_deadline_secs(&cli);
+    if secs > 0 {
+        guard::arm_watchdog(Duration::from_secs(secs), WATCHDOG_GRACE);
+    }
+
     match cli.command {
         None => overview(&ui, &cli.since, cli.json, banner),
         Some(Commands::Report {
@@ -233,6 +248,25 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
     }
+}
+
+/// How long the whole run may take before the watchdog gives up, in seconds (0 = no limit).
+const WATCHDOG_GRACE: Duration = Duration::from_secs(5);
+
+fn run_deadline_secs(cli: &Cli) -> u64 {
+    let default = match cli.command {
+        Some(Commands::About) => 0,
+        // Walking and hashing a big tree is legitimately slow.
+        Some(Commands::Baseline { .. } | Commands::Verify { .. }) => 600,
+        _ => 120,
+    };
+    cli.deadline
+        .or_else(|| {
+            std::env::var("TRIAGEX_DEADLINE")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap_or(default)
 }
 
 fn exit_for(worst: Option<Severity>) -> ExitCode {
@@ -285,6 +319,7 @@ fn overview(ui: &Ui, since: &str, json: bool, banner: bool) -> ExitCode {
         top: 3,
         ..LogOptions::default()
     });
+    guard::disarm();
 
     if json {
         if let Err(code) = print_json(&inv) {
@@ -325,6 +360,7 @@ fn report(
     if let Some(name) = verify {
         attach_integrity(&mut inv, &name);
     }
+    guard::disarm();
 
     let rendered = match format {
         Format::Text => {
@@ -406,6 +442,23 @@ fn baseline(
     opts.max_hash_bytes = max_hash_mb.saturating_mul(1024 * 1024);
 
     let base = integrity::create_baseline(&opts);
+    guard::disarm();
+    // A scan cut short by a hang or the deadline gives a partial baseline. Saving it would make
+    // `verify` report every file it never reached as deleted, so it is refused.
+    if let Some(reason) = base.aborted_reason() {
+        eprintln!("triagex: the scan did not finish ({reason}), so no baseline was saved.");
+        if let Some(s) = base
+            .skipped
+            .iter()
+            .find(|s| s.reason.starts_with("scan stopped here"))
+        {
+            eprintln!("  it stopped at: {}", s.path);
+        }
+        eprintln!(
+            "  Check that path for a hung mount, leave it out with --exclude, or raise --deadline."
+        );
+        return ExitCode::from(3);
+    }
     if base.entries.is_empty() {
         eprintln!("triagex: nothing was recorded (are the paths correct and readable?)");
         for s in base.skipped.iter().take(5) {
@@ -440,6 +493,7 @@ fn verify_cmd(ui: &Ui, name: &str, expect_digest: Option<&str>, json: bool) -> E
         }
     };
     let report = integrity::verify_baseline(name, &base, expect_digest);
+    guard::disarm();
     if json {
         if let Err(code) = print_json(&report) {
             return code;
@@ -452,6 +506,7 @@ fn verify_cmd(ui: &Ui, name: &str, expect_digest: Option<&str>, json: bool) -> E
 
 fn system_check(ui: &Ui, json: bool) -> ExitCode {
     let snap = Snapshot::collect();
+    guard::disarm();
     let findings = rules::evaluate(&snap);
 
     if json {
@@ -498,6 +553,7 @@ fn logs(
         top,
     };
     let report = analyze(&opts);
+    guard::disarm();
 
     if json {
         if let Err(code) = print_json(&report) {

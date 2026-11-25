@@ -6,17 +6,24 @@
 //! reported instead of being silently ignored.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Read, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     finding::{Finding, Severity},
+    guard,
     time::{format_rfc3339, now_epoch},
 };
 
@@ -68,6 +75,17 @@ pub struct Baseline {
     pub digest: String,
 }
 
+impl Baseline {
+    /// Why the scan that produced this baseline did not finish, if it did not. Such a baseline
+    /// is partial and must not be saved: verify would report everything it missed as deleted.
+    pub fn aborted_reason(&self) -> Option<&str> {
+        self.skipped
+            .iter()
+            .find(|s| s.path == ABORTED_PATH)
+            .map(|s| s.reason.as_str())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
     pub roots: Vec<PathBuf>,
@@ -91,6 +109,26 @@ impl ScanOptions {
 pub struct Scan {
     pub entries: BTreeMap<String, Entry>,
     pub skipped: Vec<Skipped>,
+    /// Why the scan was cut short (a hung mount, the run deadline), or None if it finished.
+    /// The entries are then only what was reached before that.
+    pub aborted: Option<String>,
+}
+
+/// The `Skipped::path` that marks a scan which did not finish. A baseline carries it in its
+/// skipped list, so a partial baseline can be recognised (and refused) later.
+pub const ABORTED_PATH: &str = "(scan aborted)";
+
+/// A walk that makes no progress for this long is stuck on dead storage. Override with
+/// TRIAGEX_STALL_SECS (a slow but alive disk may need more).
+const STALL_LIMIT: Duration = Duration::from_secs(15);
+
+fn stall_limit() -> Duration {
+    std::env::var("TRIAGEX_STALL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(STALL_LIMIT)
 }
 
 fn skip(path: impl AsRef<str>, reason: impl Into<String>) -> Skipped {
@@ -144,7 +182,13 @@ fn is_excluded(path: &str, excludes: &[String]) -> bool {
     })
 }
 
+#[cfg(test)]
 fn hash_file(path: &Path) -> io::Result<String> {
+    hash_file_with(path, || {})
+}
+
+/// `tick` runs after every chunk, so a long hash of a big file still counts as progress.
+fn hash_file_with(path: &Path, tick: impl Fn()) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; 64 * 1024];
@@ -154,48 +198,204 @@ fn hash_file(path: &Path) -> io::Result<String> {
             break;
         }
         hasher.update(&buf[..n]);
+        tick();
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+/// What the walking thread and the thread watching it share.
+struct Shared {
+    scan: Mutex<Scan>,
+    /// The path being worked on, for the message if it never finishes.
+    current: Mutex<String>,
+    started: Instant,
+    /// Milliseconds since `started` at the last sign of life.
+    last_progress_ms: AtomicU64,
+    done: AtomicBool,
+    /// Set by the watcher when it gives up; a late-waking walker must then do nothing.
+    abandoned: AtomicBool,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Shared {
+    fn new() -> Self {
+        Shared {
+            scan: Mutex::new(Scan::default()),
+            current: Mutex::new(String::new()),
+            started: Instant::now(),
+            last_progress_ms: AtomicU64::new(0),
+            done: AtomicBool::new(false),
+            abandoned: AtomicBool::new(false),
+        }
+    }
+
+    fn touch(&self) {
+        let ms = self.started.elapsed().as_millis() as u64;
+        self.last_progress_ms.store(ms, Ordering::Relaxed);
+    }
+
+    fn at(&self, path: &str) {
+        *lock(&self.current) = path.to_string();
+        self.touch();
+    }
+
+    fn idle(&self) -> Duration {
+        let last = Duration::from_millis(self.last_progress_ms.load(Ordering::Relaxed));
+        self.started.elapsed().saturating_sub(last)
+    }
+
+    fn is_abandoned(&self) -> bool {
+        self.abandoned.load(Ordering::Relaxed)
+    }
+
+    fn skip(&self, path: impl AsRef<str>, reason: impl Into<String>) {
+        lock(&self.scan).skipped.push(skip(path, reason));
+    }
+
+    fn count(&self) -> usize {
+        lock(&self.scan).entries.len()
+    }
+
+    fn insert(&self, path: String, entry: Entry) {
+        lock(&self.scan).entries.insert(path, entry);
+    }
+}
+
+/// Runs `work` on its own thread and watches it. If the thread makes no progress for `stall`,
+/// or the run deadline passes, the watcher stops waiting and returns what was gathered so far,
+/// marked as aborted. The stuck thread is abandoned: it is blocked in the kernel on dead
+/// storage and cannot be cancelled, and it will notice `abandoned` if it ever wakes up.
+fn run_guarded(stall: Duration, work: impl FnOnce(&Shared) + Send + 'static) -> Scan {
+    let shared = Arc::new(Shared::new());
+    let worker = Arc::clone(&shared);
+    let handle = thread::Builder::new()
+        .name("triagex-scan".into())
+        .spawn(move || {
+            work(&worker);
+            worker.done.store(true, Ordering::Release);
+        });
+    let handle = match handle {
+        Ok(h) => h,
+        Err(e) => {
+            let reason = format!("could not start the scan thread: {e}");
+            return Scan {
+                skipped: vec![skip(ABORTED_PATH, reason.clone())],
+                aborted: Some(reason),
+                ..Scan::default()
+            };
+        }
+    };
+
+    let reason = loop {
+        if shared.done.load(Ordering::Acquire) || handle.is_finished() {
+            break None;
+        }
+        if guard::expired() {
+            break Some("the run deadline passed".to_string());
+        }
+        let idle = shared.idle();
+        if idle >= stall {
+            break Some(format!(
+                "no progress for {} s (a hung or unreachable mount?)",
+                idle.as_secs()
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+
+    shared.abandoned.store(reason.is_some(), Ordering::Release);
+    let mut scan = std::mem::take(&mut *lock(&shared.scan));
+    if let Some(reason) = reason {
+        let at = lock(&shared.current).clone();
+        if !at.is_empty() {
+            scan.skipped.push(skip(
+                &at,
+                format!("scan stopped here: {reason}; this path or one below it did not answer"),
+            ));
+        }
+        scan.skipped.push(skip(
+            ABORTED_PATH,
+            format!("scan stopped early: {reason}; the results are incomplete"),
+        ));
+        scan.aborted = Some(reason);
+    }
+    scan
+}
+
 pub fn scan(opts: &ScanOptions) -> Scan {
-    let mut out = Scan::default();
+    let opts = opts.clone();
+    run_guarded(stall_limit(), move |sh| scan_roots(&opts, sh))
+}
+
+fn scan_roots(opts: &ScanOptions, sh: &Shared) {
+    // Network and automounted filesystems are never entered: stat() on a stale NFS mount
+    // point is itself the call that hangs, so they are skipped by name, before any stat.
+    let hang_prone = guard::hang_prone_mounts();
     for root in &opts.roots {
+        if sh.is_abandoned() {
+            return;
+        }
         let shown = root.display().to_string();
+        sh.at(&shown);
         let root = match fs::canonicalize(root) {
             Ok(p) => p,
             Err(e) => {
-                out.skipped.push(skip(shown, describe(&e)));
+                sh.skip(shown, describe(&e));
                 continue;
             }
         };
         let root_dev = fs::metadata(&root).map(|m| m.dev()).ok();
-        walk(&root, root_dev, opts, &mut out);
+        walk(&root, root_dev, opts, &hang_prone, sh);
     }
-    out
 }
 
-fn walk(start: &Path, root_dev: Option<u64>, opts: &ScanOptions, out: &mut Scan) {
+fn walk(
+    start: &Path,
+    root_dev: Option<u64>,
+    opts: &ScanOptions,
+    hang_prone: &HashMap<PathBuf, String>,
+    sh: &Shared,
+) {
     let mut stack = vec![start.to_path_buf()];
     while let Some(path) = stack.pop() {
+        if sh.is_abandoned() {
+            return;
+        }
         let shown = path.to_string_lossy().into_owned();
         if is_excluded(&shown, &opts.excludes) {
             continue;
         }
-        if out.entries.len() >= opts.max_files {
-            out.skipped.push(skip(
+        // A root named on the command line is scanned even if it is itself a network mount
+        // (the stall watchdog covers that); anything found *below* a root is not.
+        if path != start
+            && let Some(fstype) = hang_prone.get(&path)
+        {
+            sh.skip(
+                &shown,
+                format!(
+                    "{fstype} mount point (can hang when the server is unreachable), not scanned"
+                ),
+            );
+            continue;
+        }
+        if sh.count() >= opts.max_files {
+            sh.skip(
                 &shown,
                 format!(
                     "file limit ({}) reached; the scan is incomplete",
                     opts.max_files
                 ),
-            ));
+            );
             break;
         }
+        sh.at(&shown);
         let meta = match fs::symlink_metadata(&path) {
             Ok(m) => m,
             Err(e) => {
-                out.skipped.push(skip(&shown, describe(&e)));
+                sh.skip(&shown, describe(&e));
                 continue;
             }
         };
@@ -219,42 +419,39 @@ fn walk(start: &Path, root_dev: Option<u64>, opts: &ScanOptions, out: &mut Scan)
         } else if ft.is_dir() {
             entry.kind = EntryKind::Dir;
             if Some(meta.dev()) != root_dev {
-                out.skipped.push(skip(
-                    &shown,
-                    "different filesystem (mount point), not scanned",
-                ));
+                sh.skip(&shown, "different filesystem (mount point), not scanned");
             } else {
                 match fs::read_dir(&path) {
                     Ok(rd) => stack.extend(rd.flatten().map(|c| c.path())),
-                    Err(e) => out.skipped.push(skip(&shown, describe(&e))),
+                    Err(e) => sh.skip(&shown, describe(&e)),
                 }
             }
         } else if ft.is_file() {
             if meta.len() > opts.max_hash_bytes {
-                out.skipped.push(skip(
+                sh.skip(
                     &shown,
                     format!(
                         "too large to hash ({} bytes); size and mode are still tracked",
                         meta.len()
                     ),
-                ));
+                );
             } else {
-                match hash_file(&path) {
+                match hash_file_with(&path, || sh.touch()) {
                     Ok(h) => entry.hash = Some(h),
                     Err(e) => {
-                        out.skipped.push(skip(&shown, describe(&e)));
+                        sh.skip(&shown, describe(&e));
                         continue;
                     }
                 }
             }
         } else {
-            out.skipped.push(skip(
-                &shown,
-                "special file (socket, device or pipe), skipped",
-            ));
+            sh.skip(&shown, "special file (socket, device or pipe), skipped");
             continue;
         }
-        out.entries.insert(shown, entry);
+        if sh.is_abandoned() {
+            return;
+        }
+        sh.insert(shown, entry);
     }
 }
 
@@ -277,7 +474,9 @@ fn compute_digest(
 }
 
 pub fn create_baseline(opts: &ScanOptions) -> Baseline {
-    let Scan { entries, skipped } = scan(opts);
+    let Scan {
+        entries, skipped, ..
+    } = scan(opts);
     let roots: Vec<String> = opts
         .roots
         .iter()
@@ -521,7 +720,10 @@ pub fn verify(
 
     for (path, old) in &baseline.entries {
         let Some(new) = current.entries.get(path) else {
-            report.deleted.push(path.clone());
+            // After an aborted scan, "not found" only means "not reached".
+            if current.aborted.is_none() {
+                report.deleted.push(path.clone());
+            }
             continue;
         };
         if old.kind != new.kind {
@@ -563,6 +765,23 @@ pub fn verify(
         .collect();
 
     report.findings = findings(&report, &current.entries);
+    if let Some(reason) = &current.aborted {
+        report.findings.push(Finding {
+            id: "integrity.scan-incomplete".to_string(),
+            severity: Severity::Warning,
+            title: "The file scan did not finish, so this comparison is incomplete".to_string(),
+            evidence: format!(
+                "{reason}. {} of {} baseline paths were reached before it stopped; deleted-file detection is off for this run.",
+                current.entries.len(),
+                baseline.entries.len()
+            ),
+            next_step: "Find the path the scan stopped at (see the unreadable list) and check its storage: mount, df, dmesg. If the disk is only slow, raise --deadline or set TRIAGEX_STALL_SECS, then verify again.".to_string(),
+            source: SOURCE.to_string(),
+        });
+        report
+            .findings
+            .sort_by(|a, b| b.severity.cmp(&a.severity).then_with(|| a.id.cmp(&b.id)));
+    }
     report
 }
 
@@ -1238,5 +1457,178 @@ mod tests {
             data_dir_for(false, Some(""), Some("/h")),
             PathBuf::from("/h/.local/share/triagex")
         );
+    }
+
+    // ---------- hang protection ----------
+
+    fn entry_stub() -> Entry {
+        Entry {
+            kind: EntryKind::File,
+            size: 1,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            hash: None,
+            target: None,
+        }
+    }
+
+    #[test]
+    fn a_finished_scan_is_not_marked_aborted() {
+        let t = Tmp::new("fin");
+        t.write("a", "1");
+        let s = scan(&opts(&t));
+        assert!(s.aborted.is_none());
+        assert!(s.skipped.iter().all(|k| k.path != ABORTED_PATH));
+    }
+
+    #[test]
+    fn a_stuck_scan_gives_up_and_returns_what_it_had() {
+        let started = Instant::now();
+        let s = run_guarded(Duration::from_millis(200), |sh| {
+            sh.at("/data/ok");
+            sh.insert("/data/ok".into(), entry_stub());
+            sh.at("/mnt/dead-nfs/file");
+            // Stands in for a stat() on a stale NFS mount.
+            thread::sleep(Duration::from_secs(30));
+        });
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(s.entries.len(), 1);
+        assert!(s.aborted.as_deref().unwrap().contains("no progress"));
+        let at = s
+            .skipped
+            .iter()
+            .find(|k| k.path == "/mnt/dead-nfs/file")
+            .expect("the path it was stuck at is named");
+        assert!(at.reason.contains("did not answer"));
+        assert!(s.skipped.iter().any(|k| k.path == ABORTED_PATH));
+    }
+
+    #[test]
+    fn steady_progress_is_not_mistaken_for_a_hang() {
+        // Takes longer overall than the stall limit, but never goes quiet for that long.
+        let s = run_guarded(Duration::from_millis(300), |sh| {
+            for i in 0..12 {
+                sh.at("/slow");
+                sh.insert(format!("/slow/{i}"), entry_stub());
+                thread::sleep(Duration::from_millis(60));
+            }
+        });
+        assert!(s.aborted.is_none());
+        assert_eq!(s.entries.len(), 12);
+    }
+
+    #[test]
+    fn a_walker_that_wakes_late_changes_nothing() {
+        let s = run_guarded(Duration::from_millis(100), |sh| {
+            thread::sleep(Duration::from_millis(600));
+            if !sh.is_abandoned() {
+                sh.insert("/late".into(), entry_stub());
+            }
+        });
+        assert!(s.aborted.is_some());
+        thread::sleep(Duration::from_millis(800));
+        assert!(s.entries.is_empty());
+    }
+
+    #[test]
+    fn network_mounts_below_a_root_are_skipped_without_being_touched() {
+        let t = Tmp::new("nfs");
+        t.write("keep/a", "1");
+        t.write("mnt/inside", "2");
+        let root = fs::canonicalize(&t.0).unwrap();
+        let mut hp = HashMap::new();
+        hp.insert(root.join("mnt"), "nfs4".to_string());
+
+        let sh = Shared::new();
+        let o = opts(&t);
+        let dev = fs::metadata(&root).map(|m| m.dev()).ok();
+        walk(&root, dev, &o, &hp, &sh);
+        let s = lock(&sh.scan);
+
+        assert!(s.entries.contains_key(&key(&t, "keep/a")));
+        assert!(
+            !s.entries.contains_key(&key(&t, "mnt")),
+            "mount point was stat'ed"
+        );
+        assert!(!s.entries.contains_key(&key(&t, "mnt/inside")));
+        let why = s.skipped.iter().find(|k| k.path.ends_with("/mnt")).unwrap();
+        assert!(why.reason.contains("nfs4 mount point"));
+    }
+
+    #[test]
+    fn a_root_that_is_itself_a_network_mount_is_still_scanned() {
+        let t = Tmp::new("nfsroot");
+        t.write("a", "1");
+        let root = fs::canonicalize(&t.0).unwrap();
+        let mut hp = HashMap::new();
+        hp.insert(root.clone(), "nfs4".to_string());
+
+        let sh = Shared::new();
+        let dev = fs::metadata(&root).map(|m| m.dev()).ok();
+        walk(&root, dev, &opts(&t), &hp, &sh);
+        assert!(lock(&sh.scan).entries.contains_key(&key(&t, "a")));
+    }
+
+    #[test]
+    fn an_incomplete_scan_does_not_report_unreached_files_as_deleted() {
+        let t = Tmp::new("partial");
+        t.write("a", "1");
+        t.write("b", "2");
+        let base = create_baseline(&opts(&t));
+        assert_eq!(base.aborted_reason(), None);
+
+        let cut_short = Scan {
+            aborted: Some("no progress for 15 s".into()),
+            skipped: vec![skip(ABORTED_PATH, "scan stopped early")],
+            ..Scan::default()
+        };
+        let r = verify("t", &base, None, &cut_short);
+        assert!(r.deleted.is_empty());
+        let f = r
+            .findings
+            .iter()
+            .find(|f| f.id == "integrity.scan-incomplete")
+            .expect("says the comparison is incomplete");
+        assert_eq!(f.severity, Severity::Warning);
+        assert!(!r.findings.iter().any(|f| f.id == "integrity.deleted"));
+    }
+
+    #[test]
+    fn a_complete_scan_still_reports_deleted_files() {
+        let t = Tmp::new("deleted-still");
+        t.write("a", "1");
+        t.write("b", "2");
+        let base = create_baseline(&opts(&t));
+        fs::remove_file(t.path("b")).unwrap();
+        let r = verify_baseline("t", &base, None);
+        assert_eq!(r.deleted, vec![key_of_removed(&t, "b")]);
+        assert!(
+            !r.findings
+                .iter()
+                .any(|f| f.id == "integrity.scan-incomplete")
+        );
+    }
+
+    fn key_of_removed(t: &Tmp, rel: &str) -> String {
+        fs::canonicalize(&t.0)
+            .unwrap()
+            .join(rel)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn a_baseline_from_an_aborted_scan_is_recognised() {
+        let t = Tmp::new("abase");
+        t.write("a", "1");
+        let mut base = create_baseline(&opts(&t));
+        assert_eq!(base.aborted_reason(), None);
+        base.skipped.push(skip(
+            ABORTED_PATH,
+            "scan stopped early: no progress for 15 s",
+        ));
+        assert!(base.aborted_reason().unwrap().contains("no progress"));
     }
 }
