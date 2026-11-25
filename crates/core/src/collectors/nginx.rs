@@ -280,7 +280,7 @@ pub fn fetch_status(url: &str) -> Result<StubStatus, String> {
         .ok_or_else(|| "not an HTTP response".to_string())?;
     let status_line = head.lines().next().unwrap_or("");
     if !status_line.contains(" 200") {
-        return Err(format!("{}", clean(status_line)));
+        return Err(clean(status_line).to_string());
     }
     parse_stub_status(body).ok_or_else(|| "the page is not nginx stub_status output".to_string())
 }

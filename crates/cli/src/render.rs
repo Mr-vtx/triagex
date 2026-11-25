@@ -1317,7 +1317,7 @@ mod tests {
                 errors: errors.iter().map(|e| e.to_string()).collect(),
                 warnings: vec![],
             },
-            status: status.then(|| StubStatus {
+            status: status.then_some(StubStatus {
                 active: 12,
                 accepts: 500,
                 handled: 498,
