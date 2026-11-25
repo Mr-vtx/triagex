@@ -33,7 +33,7 @@ $ triagex
 
 ## Install
 
-Once v0.1.0 is released:
+Install:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Mr-vtx/triagex/main/install.sh | sh

@@ -2,7 +2,7 @@
 
 All notable changes are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased] - heading to 0.1.0
+## [0.1.0] - 2026-11-25
 
 ### Added
 - `triagex` overview, `report` (text, JSON, Markdown), `check` and `about`.
