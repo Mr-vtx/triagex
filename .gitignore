@@ -3,3 +3,8 @@ report*.md
 *.zip
 report*.json
 
+*.zip
+node_modules/
+.next/
+dist/
+.env*
